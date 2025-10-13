@@ -9,6 +9,7 @@
 #include <cstdlib>  // for atexit
 
 #include "integration_utils.h"
+#include "transfer_engine/transfer_engine_py.h"
 
 namespace py = pybind11;
 
@@ -299,33 +300,41 @@ PYBIND11_MODULE(store, m) {
     // methods
     py::class_<MooncakeStorePyWrapper>(m, "MooncakeDistributedStore")
         .def(py::init<>())
-        .def(
-            "setup",
-            [](MooncakeStorePyWrapper &self, const std::string &local_hostname,
-               const std::string &metadata_server,
-               size_t global_segment_size = 1024 * 1024 * 16,
-               size_t local_buffer_size = 1024 * 1024 * 16,
-               const std::string &protocol = "tcp",
-               const std::string &rdma_devices = "",
-               const std::string &master_server_addr = "127.0.0.1:50051",
-               const py::object &engine = py::none()) {
-                if (!self.store_) {
-                    self.store_ = PyClient::create();
-                }
-                std::shared_ptr<TransferEngine> transfer_engine = nullptr;
-                if (!engine.is_none()) {
-                    transfer_engine =
-                        engine.cast<std::shared_ptr<TransferEngine>>();
-                }
-                return self.store_->setup(
-                    local_hostname, metadata_server, global_segment_size,
-                    local_buffer_size, protocol, rdma_devices,
-                    master_server_addr, transfer_engine);
-            },
-            py::arg("local_hostname"), py::arg("metadata_server"),
-            py::arg("global_segment_size"), py::arg("local_buffer_size"),
-            py::arg("protocol"), py::arg("rdma_devices"),
-            py::arg("master_server_addr"), py::arg("engine") = py::none())
+        .def("setup",
+             [](MooncakeStorePyWrapper &self, const std::string &local_hostname,
+                const std::string &metadata_server,
+                size_t global_segment_size = 1024 * 1024 * 16,
+                size_t local_buffer_size = 1024 * 1024 * 16,
+                const std::string &protocol = "tcp",
+                const std::string &rdma_devices = "",
+                const std::string &master_server_addr = "127.0.0.1:50051") {
+                 if (!self.store_) {
+                     self.store_ = PyClient::create();
+                 }
+                 return self.store_->setup(local_hostname, metadata_server,
+                                           global_segment_size,
+                                           local_buffer_size, protocol,
+                                           rdma_devices, master_server_addr);
+             })
+        .def("setup",
+             [](MooncakeStorePyWrapper &self,
+                const TransferEnginePy &transfer_engine,
+                const std::string &metadata_server,
+                size_t global_segment_size = 1024 * 1024 * 16,
+                size_t local_buffer_size = 1024 * 1024 * 16,
+                const std::string &protocol = "tcp",
+                const std::string &rdma_devices = "",
+                const std::string &master_server_addr = "127.0.0.1:50051") {
+                 if (!self.store_) {
+                     self.store_ = PyClient::create();
+                 }
+                 std::string local_hostname =
+                     transfer_engine.getEngine()->getLocalIpAndPort();
+                 return self.store_->setup(
+                     local_hostname, metadata_server, global_segment_size,
+                     local_buffer_size, protocol, rdma_devices,
+                     master_server_addr, transfer_engine.getEngine());
+             })
         .def("init_all",
              [](MooncakeStorePyWrapper &self, const std::string &protocol,
                 const std::string &device_name,
