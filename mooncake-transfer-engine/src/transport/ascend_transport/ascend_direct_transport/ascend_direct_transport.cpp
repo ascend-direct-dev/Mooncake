@@ -22,8 +22,8 @@
 #include <cassert>
 #include <memory>
 #include <numeric>
-#include <string>
 #include <random>
+#include <string>
 
 #include "ascend_allocator.h"
 #include "common.h"
@@ -34,10 +34,20 @@
 
 namespace mooncake {
 namespace {
+constexpr size_t kNonAgentAdxlEngineCount = 100U;
 
-int32_t ResolveCurrentEngineId(bool dummy_real_mode) {
-    if (!dummy_real_mode) {
+int32_t PickRandomEngineId(size_t engine_count) {
+    if (engine_count <= 1U) {
         return 0;
+    }
+    static thread_local std::mt19937 gen(std::random_device{}());
+    std::uniform_int_distribution<size_t> dist(0, engine_count - 1U);
+    return static_cast<int32_t>(dist(gen));
+}
+
+int32_t ResolveCurrentEngineId(bool dummy_real_mode, size_t engine_count) {
+    if (!dummy_real_mode) {
+        return PickRandomEngineId(engine_count);
     }
     int32_t current_device_id = 0;
     if (aclrtGetDevice(&current_device_id) != ACL_ERROR_NONE) {
@@ -131,14 +141,24 @@ int AscendDirectTransport::addEngineToSegmentDesc(int32_t device_id,
                                                   aclrtContext context,
                                                   const std::string &host_ip,
                                                   SegmentDesc *desc) {
-    uint16_t listen_port = FindAdxlListenPort(base_port_, device_id);
-    if (listen_port == 0) {
+    return addEnginesToSegmentDesc(device_id, context, host_ip, 1U, desc);
+}
+
+int AscendDirectTransport::addEnginesToSegmentDesc(int32_t device_id,
+                                                   aclrtContext context,
+                                                   const std::string &host_ip,
+                                                   size_t engine_count,
+                                                   SegmentDesc *desc) {
+    auto listen_ports = FindAdxlListenPorts(base_port_, device_id, engine_count);
+    if (listen_ports.size() != engine_count) {
         LOG(ERROR) << "Find available port failed for device: " << device_id;
         return FAILED;
     }
-    local_engine_contexts_.push_back(context);
-    desc->rank_info.endpoints.push_back(
-        GenAdxlEngineName(host_ip, listen_port));
+    for (auto listen_port : listen_ports) {
+        local_engine_contexts_.push_back(context);
+        desc->rank_info.endpoints.push_back(
+            GenAdxlEngineName(host_ip, listen_port));
+    }
     return 0;
 }
 
@@ -203,8 +223,9 @@ int AscendDirectTransport::allocateLocalSegmentID() {
         CHECK_ACL(aclrtGetDevice(&device_logic_id));
         aclrtContext engine_context = nullptr;
         CHECK_ACL(aclrtGetCurrentContext(&engine_context));
-        auto ret = addEngineToSegmentDesc(device_logic_id, engine_context,
-                                          host_ip, desc.get());
+        auto ret = addEnginesToSegmentDesc(device_logic_id, engine_context,
+                                           host_ip, kNonAgentAdxlEngineCount,
+                                           desc.get());
         if (ret != 0) return ret;
     }
     metadata_->addLocalSegment(LOCAL_SEGMENT_ID, local_server_name_,
@@ -224,7 +245,8 @@ Status AscendDirectTransport::submitTransfer(
             std::to_string(batch_id));
     }
 
-    const int32_t current_engine_id = ResolveCurrentEngineId(dummy_real_mode_);
+    const int32_t current_engine_id =
+        ResolveCurrentEngineId(dummy_real_mode_, local_engine_contexts_.size());
     if (current_engine_id < 0) {
         return Status::Context("aclrtGetDevice failed");
     }
@@ -252,7 +274,8 @@ Status AscendDirectTransport::submitTransfer(
 
 Status AscendDirectTransport::submitTransferTask(
     const std::vector<TransferTask *> &task_list) {
-    const int32_t current_engine_id = ResolveCurrentEngineId(dummy_real_mode_);
+    const int32_t current_engine_id =
+        ResolveCurrentEngineId(dummy_real_mode_, local_engine_contexts_.size());
     if (current_engine_id < 0) {
         return Status::Context("aclrtGetDevice failed");
     }

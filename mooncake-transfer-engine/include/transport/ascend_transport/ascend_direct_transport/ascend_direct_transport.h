@@ -75,6 +75,9 @@ class AscendDirectTransport : public Transport {
     // Add one engine to segment desc
     int addEngineToSegmentDesc(int32_t device_id, aclrtContext context,
                                const std::string &host_ip, SegmentDesc *desc);
+    int addEnginesToSegmentDesc(int32_t device_id, aclrtContext context,
+                                const std::string &host_ip, size_t engine_count,
+                                SegmentDesc *desc);
 
     int32_t base_port_ = 20000;
     bool dummy_real_mode_{false};

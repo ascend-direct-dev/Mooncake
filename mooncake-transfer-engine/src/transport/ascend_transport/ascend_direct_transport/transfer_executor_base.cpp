@@ -270,6 +270,35 @@ int TransferExecutorBase::checkAndConnect(
     return 0;
 }
 
+int TransferExecutorBase::prepareConnectionsForTransfer(
+    size_t engine_idx,
+    const std::shared_ptr<TransferMetadata::SegmentDesc>& segment_desc) {
+    const auto& endpoints = segment_desc->rank_info.endpoints;
+    bool connect_all_engines = !params_.dummy_real_mode &&
+                               adxl_engines_.size() > 1U &&
+                               endpoints.size() >= adxl_engines_.size();
+    if (!connect_all_engines) {
+        auto target_adxl_engine_name =
+            resolveTargetAdxlEngineName(segment_desc, engine_idx);
+        if (target_adxl_engine_name.empty()) {
+            return -1;
+        }
+        return checkAndConnect(engine_idx, target_adxl_engine_name);
+    }
+    for (size_t idx = 0; idx < adxl_engines_.size(); ++idx) {
+        auto target_adxl_engine_name =
+            resolveTargetAdxlEngineName(segment_desc, idx);
+        if (target_adxl_engine_name.empty()) {
+            return -1;
+        }
+        int ret = checkAndConnect(idx, target_adxl_engine_name);
+        if (ret != 0) {
+            return ret;
+        }
+    }
+    return 0;
+}
+
 int TransferExecutorBase::disconnect(size_t engine_idx,
                                      const std::string& target_adxl_engine_name,
                                      int32_t timeout_in_millis) {
@@ -403,6 +432,7 @@ int TransferExecutorBase::registerMem(void* addr, size_t length,
 
     std::vector<size_t> engine_indices;
     bool register_to_all =
+        (!dummy_real_mode && adxl_engines_.size() > 1U) ||
         (roce_mode && dummy_real_mode && ascend_is_store_memory(addr, length));
     if (register_to_all || adxl_engines_.size() == 1U) {
         engine_indices.resize(adxl_engines_.size());
@@ -507,6 +537,10 @@ std::string TransferExecutorBase::resolveTargetAdxlEngineName(
         }
         return endpoints[engine_idx];
     }
+    if (!params_.dummy_real_mode && adxl_engines_.size() > 1U &&
+        engine_idx < endpoints.size()) {
+        return endpoints[engine_idx];
+    }
     if (!endpoints.empty()) {
         return endpoints.front();
     }
@@ -518,8 +552,11 @@ void TransferExecutorBase::processSliceList(
     if (slice_list.empty()) {
         return;
     }
-    size_t local_engine_idx =
-        params_.dummy_real_mode ? slice_list[0]->ascend_direct.engine_id : 0;
+    size_t local_engine_idx = 0;
+    if (slice_list[0]->ascend_direct.engine_id >= 0) {
+        local_engine_idx =
+            static_cast<size_t>(slice_list[0]->ascend_direct.engine_id);
+    }
     VLOG(1) << "processSliceList for dev:" << local_engine_idx;
     auto local_segment_desc = metadata_->getSegmentDescByID(LOCAL_SEGMENT_ID);
     if (!local_segment_desc ||
@@ -577,8 +614,14 @@ void TransferExecutorBase::processSliceList(
             return;
         }
 
-        result = execute(local_engine_idx, target_adxl_engine_name, operation,
-                         slice_list);
+        if (!params_.auto_connect &&
+            prepareConnectionsForTransfer(local_engine_idx,
+                                          target_segment_desc) != 0) {
+            result = {.ret = -1, .status = adxl::FAILED, .retryable = true};
+        } else {
+            result = execute(local_engine_idx, target_adxl_engine_name,
+                             operation, slice_list);
+        }
         if (result.ret == 0 || !result.retryable ||
             retry + 1 >= kTransferRetryTimes) {
             break;

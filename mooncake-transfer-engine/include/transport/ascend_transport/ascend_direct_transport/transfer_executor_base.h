@@ -94,6 +94,9 @@ class TransferExecutorBase {
     void finalizeEngines();
     void disconnectAllForEngine(size_t engine_idx);
 
+    int prepareConnectionsForTransfer(
+        size_t engine_idx,
+        const std::shared_ptr<TransferMetadata::SegmentDesc>& segment_desc);
     int checkAndConnect(size_t engine_idx,
                         const std::string& target_adxl_engine_name);
     int disconnect(size_t engine_idx,

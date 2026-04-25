@@ -38,6 +38,7 @@ using namespace mooncake;
 
 namespace {
 constexpr int kDummyRealRoceEngineCount = 16;
+constexpr size_t kNonAgentAdxlEngineCount = 100U;
 constexpr size_t kTransferBufSize = 4096;
 constexpr size_t kRegisterMemSize = 1024 * 1024;
 constexpr int kTransferStatusMaxRetries = 1000;
@@ -319,6 +320,8 @@ static std::deque<adxl::Status> g_transfer_results;
 static std::deque<adxl::Status> g_transfer_async_results;
 static std::vector<uintptr_t> g_registered_mem_handles;
 static std::vector<uintptr_t> g_deregistered_mem_handles;
+static std::vector<std::string> g_initialized_engine_names;
+static std::vector<std::string> g_transfer_remote_engines;
 static std::set<std::string> g_connected;
 static std::mutex g_mutex;
 static bool g_was_initialize_called = false;
@@ -344,6 +347,8 @@ void reset() {
     g_transfer_async_results.clear();
     g_registered_mem_handles.clear();
     g_deregistered_mem_handles.clear();
+    g_initialized_engine_names.clear();
+    g_transfer_remote_engines.clear();
     g_connected.clear();
     g_was_initialize_called = false;
     g_next_handle = 1;
@@ -446,6 +451,16 @@ std::vector<uintptr_t> get_deregistered_mem_handles() {
     std::lock_guard<std::mutex> lock(g_mutex);
     return g_deregistered_mem_handles;
 }
+
+size_t get_initialize_count() {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    return g_initialized_engine_names.size();
+}
+
+std::vector<std::string> get_transfer_remote_engines() {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    return g_transfer_remote_engines;
+}
 }  // namespace adxl_mock
 
 }  // namespace
@@ -461,9 +476,10 @@ AdxlEngine::~AdxlEngine() = default;
 Status AdxlEngine::Initialize(
     const AscendString& name,
     const std::map<AscendString, AscendString>& options) {
-    (void)name;
     (void)options;
+    std::lock_guard<std::mutex> lock(g_mutex);
     g_was_initialize_called = true;
+    g_initialized_engine_names.push_back(std::string(name.GetString()));
     return g_initialize_result;
 }
 
@@ -498,6 +514,8 @@ Status AdxlEngine::TransferSync(const AscendString& remote_engine,
     {
         std::lock_guard<std::mutex> lock(g_mutex);
         g_transfer_count++;
+        g_transfer_remote_engines.push_back(
+            std::string(remote_engine.GetString()));
         if (!g_transfer_results.empty()) {
             result = g_transfer_results.front();
             g_transfer_results.pop_front();
@@ -526,6 +544,8 @@ Status AdxlEngine::TransferAsync(const AscendString& remote_engine,
     {
         std::lock_guard<std::mutex> lock(g_mutex);
         g_transfer_async_count++;
+        g_transfer_remote_engines.push_back(
+            std::string(remote_engine.GetString()));
         if (!g_transfer_async_results.empty()) {
             result = g_transfer_async_results.front();
             g_transfer_async_results.pop_front();
@@ -634,14 +654,17 @@ class AscendDirectTransportTest : public ::testing::Test {
     };
 
     void addRemoteSegment(std::shared_ptr<TransferMetadata> meta,
-                          const RemoteSegmentSetup& s) {
+                          const RemoteSegmentSetup& s,
+                          size_t endpoint_count = 1U) {
         auto remote_desc = std::make_shared<TransferMetadata::SegmentDesc>();
         remote_desc->name = s.name;
         remote_desc->protocol = "ascend";
         remote_desc->rank_info.hostIp = s.host_ip;
         remote_desc->rank_info.hostPort = s.port;
-        remote_desc->rank_info.endpoints.push_back(s.host_ip + ":" +
-                                                   std::to_string(s.port));
+        for (size_t i = 0; i < endpoint_count; ++i) {
+            remote_desc->rank_info.endpoints.push_back(
+                s.host_ip + ":" + std::to_string(s.port + i));
+        }
         meta->addLocalSegment(s.segment_id, s.name, std::move(remote_desc));
     }
 
@@ -783,6 +806,18 @@ TEST_F(AscendDirectTransportTest, Basic_InstallSuccess) {
     auto transport = createTransport();
     ASSERT_NE(transport, nullptr);
     EXPECT_TRUE(adxl_mock::was_initialize_called());
+}
+
+TEST_F(AscendDirectTransportTest, Install_NonAgentPublishes100Endpoints) {
+    globalConfig().ascend_agent_mode = false;
+    auto transport = createTransport();
+    ASSERT_NE(transport, nullptr);
+
+    auto local_desc = transport->meta()->getSegmentDescByID(LOCAL_SEGMENT_ID);
+    ASSERT_NE(local_desc, nullptr);
+    EXPECT_EQ(local_desc->rank_info.endpoints.size(),
+              kNonAgentAdxlEngineCount);
+    EXPECT_EQ(adxl_mock::get_initialize_count(), kNonAgentAdxlEngineCount);
 }
 
 TEST_F(AscendDirectTransportTest, Basic_InstallFailsWhenAdxlInitializeFails) {
@@ -1533,6 +1568,40 @@ TEST_F(AscendDirectTransportTest, RemoteTransfer_Sync_Success) {
     EXPECT_FALSE(result.failed) << "Remote transfer should not fail";
     EXPECT_GT(adxl_mock::get_transfer_count(), 0)
         << "ADXL transfer should have been called";
+}
+
+TEST_F(AscendDirectTransportTest,
+       RemoteTransfer_Sync_NonAgentConnects100AndTransfersOnOne) {
+    adxl_mock::set_transfer_result(adxl::SUCCESS);
+
+    auto transport = createTransport();
+    ASSERT_NE(transport, nullptr);
+    ASSERT_EQ(transport->registerLocalMemory(test_buffer_src_, kRegisterMemSize,
+                                             "cpu:0", true, true),
+              0);
+    EXPECT_EQ(adxl_mock::get_register_mem_count(),
+              kNonAgentAdxlEngineCount);
+
+    const RemoteSegmentSetup remote_setup = {1, "remote_server",
+                                             "192.168.1.210", 41000};
+    addRemoteSegment(transport->meta(), remote_setup,
+                     kNonAgentAdxlEngineCount);
+
+    auto result = runRemoteTransfer(transport.get(), test_buffer_src_, 1,
+                                    0x10000, kTransferBufSize);
+    ASSERT_TRUE(result.finished);
+    EXPECT_FALSE(result.failed);
+    EXPECT_EQ(adxl_mock::get_connect_count(), kNonAgentAdxlEngineCount);
+    EXPECT_EQ(adxl_mock::get_transfer_count(), 1);
+
+    auto remote_engines = adxl_mock::get_transfer_remote_engines();
+    ASSERT_EQ(remote_engines.size(), 1U);
+    auto target_desc = transport->meta()->getSegmentDescByID(1);
+    ASSERT_NE(target_desc, nullptr);
+    const auto& endpoints = target_desc->rank_info.endpoints;
+    EXPECT_NE(std::find(endpoints.begin(), endpoints.end(),
+                        remote_engines.front()),
+              endpoints.end());
 }
 
 TEST_F(AscendDirectTransportTest,

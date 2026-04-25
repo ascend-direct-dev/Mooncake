@@ -79,6 +79,9 @@ std::string GenAdxlEngineName(const std::string &ip, const uint64_t port);
 
 uint16_t FindAdxlListenPort(int32_t base_port, int32_t device_id);
 
+std::vector<uint16_t> FindAdxlListenPorts(int32_t base_port, int32_t device_id,
+                                          size_t port_count);
+
 int SetDeviceAndGetContext(int32_t device_id, aclrtContext *out_context);
 
 /**
