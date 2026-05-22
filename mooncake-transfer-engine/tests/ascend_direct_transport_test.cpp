@@ -912,6 +912,33 @@ TEST_F(AscendDirectTransportTest,
     globalConfig().ascend_agent_mode = false;
 }
 
+TEST_F(AscendDirectTransportTest,
+       Install_DummyRealFabricMemSingleDevice_PublishesOneEndpoint) {
+    globalConfig().ascend_agent_mode = true;
+    globalConfig().ascend_use_fabric_mem = true;
+    ContextManager::getInstance().finalize();
+    constexpr int kEngineCount = 8;
+    mock_acl::set_device_count(kEngineCount);
+    ASSERT_TRUE(ContextManager::getInstance().initialize())
+        << "Re-init ContextManager for single-device fabric mem test";
+    unsetenv("HCCL_INTRA_ROCE_ENABLE");
+    setenv("ASCEND_DUMMY_REAL_SINGLE_DEVICE", "1", 1);
+
+    auto transport = createTransport();
+    ASSERT_NE(transport, nullptr);
+    auto metadata = transport->meta();
+    ASSERT_NE(metadata, nullptr);
+    auto local_desc = metadata->getSegmentDescByID(0);
+    ASSERT_NE(local_desc, nullptr);
+    EXPECT_EQ(local_desc->rank_info.endpoints.size(), 1u)
+        << "single-device mode should publish one endpoint despite "
+           "multiple devices";
+
+    unsetenv("ASCEND_DUMMY_REAL_SINGLE_DEVICE");
+    globalConfig().ascend_agent_mode = false;
+    globalConfig().ascend_use_fabric_mem = false;
+}
+
 // -----------------------------------------------------------------------------
 // Dummy-real flow tests (dummy registers memory, forwards to real, real
 // executes transfer)

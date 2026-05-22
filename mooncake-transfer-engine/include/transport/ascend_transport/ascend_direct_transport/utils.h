@@ -81,6 +81,10 @@ uint16_t FindAdxlListenPort(int32_t base_port, int32_t device_id);
 
 int SetDeviceAndGetContext(int32_t device_id, aclrtContext *out_context);
 
+// When enabled, dummy-real + fabric_mem uses a single ADXL engine (device 0)
+// for performance comparison. Requires ASCEND_DUMMY_REAL_SINGLE_DEVICE=1.
+bool IsDummyRealFabricSingleDeviceMode(bool roce_mode);
+
 /**
  * @brief A simple thread pool for executing tasks asynchronously.
  *

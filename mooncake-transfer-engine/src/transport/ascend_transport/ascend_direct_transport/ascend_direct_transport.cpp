@@ -35,8 +35,11 @@
 namespace mooncake {
 namespace {
 
-int32_t ResolveCurrentEngineId(bool dummy_real_mode) {
+int32_t ResolveCurrentEngineId(bool dummy_real_mode, bool roce_mode) {
     if (!dummy_real_mode) {
+        return 0;
+    }
+    if (IsDummyRealFabricSingleDeviceMode(roce_mode)) {
         return 0;
     }
     int32_t current_device_id = 0;
@@ -188,8 +191,15 @@ int AscendDirectTransport::allocateLocalSegmentID() {
                          << " differs from ContextManager device count "
                          << ctx_mgr.getDeviceCount();
         }
-        for (uint32_t device_id = 0; device_id < ctx_mgr.getDeviceCount();
-             ++device_id) {
+        const uint32_t engine_count =
+            IsDummyRealFabricSingleDeviceMode(roce_mode_)
+                ? 1U
+                : ctx_mgr.getDeviceCount();
+        if (engine_count == 1U && ctx_mgr.getDeviceCount() > 1U) {
+            LOG(INFO) << "Single device mode: using device 0 ADXL engine only "
+                         "for dummy-real+fabric_mem transfers";
+        }
+        for (uint32_t device_id = 0; device_id < engine_count; ++device_id) {
             aclrtContext engine_context =
                 ctx_mgr.getContext(static_cast<int32_t>(device_id));
             auto ret =
@@ -224,7 +234,8 @@ Status AscendDirectTransport::submitTransfer(
             std::to_string(batch_id));
     }
 
-    const int32_t current_engine_id = ResolveCurrentEngineId(dummy_real_mode_);
+    const int32_t current_engine_id =
+        ResolveCurrentEngineId(dummy_real_mode_, roce_mode_);
     if (current_engine_id < 0) {
         return Status::Context("aclrtGetDevice failed");
     }
@@ -252,7 +263,8 @@ Status AscendDirectTransport::submitTransfer(
 
 Status AscendDirectTransport::submitTransferTask(
     const std::vector<TransferTask *> &task_list) {
-    const int32_t current_engine_id = ResolveCurrentEngineId(dummy_real_mode_);
+    const int32_t current_engine_id =
+        ResolveCurrentEngineId(dummy_real_mode_, roce_mode_);
     if (current_engine_id < 0) {
         return Status::Context("aclrtGetDevice failed");
     }

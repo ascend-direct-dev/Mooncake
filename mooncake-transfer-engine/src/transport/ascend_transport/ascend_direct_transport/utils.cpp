@@ -16,6 +16,7 @@
 #include "transport/ascend_transport/ascend_direct_transport/utils.h"
 
 #include <random>
+#include <string>
 #include <glog/logging.h>
 
 #include "common.h"
@@ -26,6 +27,15 @@ namespace {
 constexpr int32_t kPortRange = 100;
 constexpr int32_t kMaxGenPortAttempts = 500;
 }  // namespace
+
+bool IsDummyRealFabricSingleDeviceMode(bool roce_mode) {
+    if (roce_mode || !globalConfig().ascend_agent_mode ||
+        !globalConfig().ascend_use_fabric_mem) {
+        return false;
+    }
+    const char *env = std::getenv("ASCEND_DUMMY_REAL_SINGLE_DEVICE");
+    return env != nullptr && std::string(env) == "1";
+}
 
 // AscendThreadPool implementation
 AscendThreadPool::AscendThreadPool(size_t num_threads) : running_(true) {

@@ -404,7 +404,9 @@ int TransferExecutorBase::registerMem(void* addr, size_t length,
     std::vector<size_t> engine_indices;
     bool register_to_all =
         (roce_mode && dummy_real_mode && ascend_is_store_memory(addr, length));
-    if (register_to_all || adxl_engines_.size() == 1U) {
+    if (IsDummyRealFabricSingleDeviceMode(roce_mode)) {
+        engine_indices = {0};
+    } else if (register_to_all || adxl_engines_.size() == 1U) {
         engine_indices.resize(adxl_engines_.size());
         std::iota(engine_indices.begin(), engine_indices.end(), 0);
     } else {
@@ -520,6 +522,9 @@ void TransferExecutorBase::processSliceList(
     }
     size_t local_engine_idx =
         params_.dummy_real_mode ? slice_list[0]->ascend_direct.engine_id : 0;
+    if (IsDummyRealFabricSingleDeviceMode(params_.roce_mode)) {
+        local_engine_idx = 0;
+    }
     VLOG(1) << "processSliceList for dev:" << local_engine_idx;
     auto local_segment_desc = metadata_->getSegmentDescByID(LOCAL_SEGMENT_ID);
     if (!local_segment_desc ||
