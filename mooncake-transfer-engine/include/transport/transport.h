@@ -159,6 +159,8 @@ class Transport {
                 void *handle;
                 int64_t start_time;
                 int32_t engine_id;
+                // Remote store segment engine index; -1 uses local engine_id.
+                int32_t dst_engine_id;
             } ascend_direct;
             struct {
                 uint64_t dest_addr;

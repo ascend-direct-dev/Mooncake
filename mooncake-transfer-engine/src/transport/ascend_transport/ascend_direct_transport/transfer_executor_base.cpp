@@ -24,6 +24,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <numeric>
 #include <unistd.h>
 
@@ -401,26 +402,44 @@ int TransferExecutorBase::registerMem(void* addr, size_t length,
     MAKE_GUARD(ctx_restore,
                [saved_ctx]() { (void)aclrtSetCurrentContext(saved_ctx); });
 
-    std::vector<size_t> engine_indices;
+    const size_t num_engines = adxl_engines_.size();
+    const bool split_store_per_engine =
+        (roce_mode && dummy_real_mode && mem_type == adxl::MEM_HOST &&
+         ascend_is_store_memory(addr, length) && num_engines > 1U);
+
     bool register_to_all =
         (roce_mode && dummy_real_mode && ascend_is_store_memory(addr, length));
-    if (register_to_all || adxl_engines_.size() == 1U) {
-        engine_indices.resize(adxl_engines_.size());
+    if (split_store_per_engine) {
+        if (length % num_engines != 0) {
+            LOG(ERROR) << "Store memory size " << length
+                       << " is not divisible by engine count " << num_engines
+                       << ", fall back to register on all engines";
+        } else {
+            register_to_all = false;
+        }
+    }
+
+    std::vector<size_t> engine_indices;
+    if (register_to_all || num_engines == 1U) {
+        engine_indices.resize(num_engines);
+        std::iota(engine_indices.begin(), engine_indices.end(), 0);
+    } else if (split_store_per_engine) {
+        engine_indices.resize(num_engines);
         std::iota(engine_indices.begin(), engine_indices.end(), 0);
     } else {
         int32_t current_device_id = 0;
         CHECK_ACL(aclrtGetDevice(&current_device_id));
         size_t engine_idx = static_cast<size_t>(current_device_id);
-        if (engine_idx >= adxl_engines_.size()) {
+        if (engine_idx >= num_engines) {
             LOG(ERROR) << "Invalid device id:" << current_device_id;
             return -1;
         }
         engine_indices = {engine_idx};
     }
 
-    adxl::MemDesc mem_desc{};
-    mem_desc.addr = reinterpret_cast<uintptr_t>(addr);
-    mem_desc.len = length;
+    const size_t segment_size =
+        split_store_per_engine && !register_to_all ? length / num_engines : length;
+    const uintptr_t base_addr = reinterpret_cast<uintptr_t>(addr);
 
     std::vector<EngineMemHandle> registered_mem_handles;
     registered_mem_handles.reserve(engine_indices.size());
@@ -439,6 +458,14 @@ int TransferExecutorBase::registerMem(void* addr, size_t length,
             rollbackRegisteredMem(registered_mem_handles);
             return -1;
         }
+        adxl::MemDesc mem_desc{};
+        if (split_store_per_engine && !register_to_all) {
+            mem_desc.addr = base_addr + engine_idx * segment_size;
+            mem_desc.len = segment_size;
+        } else {
+            mem_desc.addr = base_addr;
+            mem_desc.len = length;
+        }
         adxl::MemHandle mem_handle = nullptr;
         auto adxl_ret = adxl_engines_[engine_idx]->RegisterMem(
             mem_desc, mem_type, mem_handle);
@@ -449,8 +476,8 @@ int TransferExecutorBase::registerMem(void* addr, size_t length,
             return -1;
         }
         registered_mem_handles.emplace_back(engine_idx, mem_handle);
-        LOG(INFO) << "TransferExecutor register mem addr:" << addr
-                  << ", length:" << length << ", mem type:"
+        LOG(INFO) << "TransferExecutor register mem addr:" << mem_desc.addr
+                  << ", length:" << mem_desc.len << ", mem type:"
                   << (mem_type == adxl::MEM_HOST ? "host" : "device")
                   << ", engine index:" << engine_idx;
     }
@@ -542,61 +569,75 @@ void TransferExecutorBase::processSliceList(
         return;
     }
 
-    ExecuteResult result;
-    std::string target_adxl_engine_name;
-    bool force_update = false;
-    for (int32_t retry = 0; retry < kTransferRetryTimes; ++retry) {
-        auto target_segment_desc = metadata_->getSegmentDescByID(
-            slice_list[0]->target_id, force_update);
-        if (!target_segment_desc) {
-            LOG(ERROR) << "Cannot find segment descriptor for target_id: "
-                       << slice_list[0]->target_id;
-            markSlicesFailed(slice_list);
-            return;
+    std::map<size_t, std::vector<Transport::Slice*>> remote_groups;
+    for (auto* slice : slice_list) {
+        size_t remote_engine_idx = local_engine_idx;
+        if (slice->ascend_direct.dst_engine_id >= 0) {
+            remote_engine_idx =
+                static_cast<size_t>(slice->ascend_direct.dst_engine_id);
         }
-        target_adxl_engine_name =
-            resolveTargetAdxlEngineName(target_segment_desc, local_engine_idx);
-        if (target_adxl_engine_name.empty()) {
-            LOG(ERROR) << "Invalid local_engine_idx: " << local_engine_idx
-                       << " target endpoint size:"
-                       << target_segment_desc->rank_info.endpoints.size();
-            markSlicesFailed(slice_list);
-            return;
-        }
-
-        auto need_local_copy = !globalConfig().ascend_use_fabric_mem &&
-                               (target_adxl_engine_name == local_engine_name);
-        if (need_local_copy && local_copy_engine_) {
-            auto start = std::chrono::steady_clock::now();
-            local_copy_engine_->Copy(slice_list[0]->opcode, slice_list);
-            VLOG(1) << "Local copy time: "
-                    << std::chrono::duration_cast<std::chrono::microseconds>(
-                           std::chrono::steady_clock::now() - start)
-                           .count()
-                    << "us";
-            return;
-        }
-
-        result = execute(local_engine_idx, target_adxl_engine_name, operation,
-                         slice_list);
-        if (result.ret == 0 || !result.retryable ||
-            retry + 1 >= kTransferRetryTimes) {
-            break;
-        }
-        force_update = true;
-        LOG(INFO) << "Retry transfer to:" << target_adxl_engine_name;
+        remote_groups[remote_engine_idx].push_back(slice);
     }
 
-    if (result.ret == 0) {
-        return;
+    for (auto& [remote_engine_idx, group_slices] : remote_groups) {
+        ExecuteResult result;
+        std::string target_adxl_engine_name;
+        bool force_update = false;
+        for (int32_t retry = 0; retry < kTransferRetryTimes; ++retry) {
+            auto target_segment_desc = metadata_->getSegmentDescByID(
+                group_slices[0]->target_id, force_update);
+            if (!target_segment_desc) {
+                LOG(ERROR) << "Cannot find segment descriptor for target_id: "
+                           << group_slices[0]->target_id;
+                markSlicesFailed(group_slices);
+                return;
+            }
+            target_adxl_engine_name = resolveTargetAdxlEngineName(
+                target_segment_desc, remote_engine_idx);
+            if (target_adxl_engine_name.empty()) {
+                LOG(ERROR) << "Invalid remote_engine_idx: " << remote_engine_idx
+                           << " target endpoint size:"
+                           << target_segment_desc->rank_info.endpoints.size();
+                markSlicesFailed(group_slices);
+                return;
+            }
+
+            auto need_local_copy =
+                !globalConfig().ascend_use_fabric_mem &&
+                (target_adxl_engine_name == local_engine_name);
+            if (need_local_copy && local_copy_engine_) {
+                auto start = std::chrono::steady_clock::now();
+                local_copy_engine_->Copy(group_slices[0]->opcode, group_slices);
+                VLOG(1) << "Local copy time: "
+                        << std::chrono::duration_cast<
+                               std::chrono::microseconds>(
+                               std::chrono::steady_clock::now() - start)
+                               .count()
+                        << "us";
+                return;
+            }
+
+            result = execute(local_engine_idx, target_adxl_engine_name,
+                             operation, group_slices);
+            if (result.ret == 0 || !result.retryable ||
+                retry + 1 >= kTransferRetryTimes) {
+                break;
+            }
+            force_update = true;
+            LOG(INFO) << "Retry transfer to:" << target_adxl_engine_name;
+        }
+
+        if (result.ret == 0) {
+            continue;
+        }
+        if (result.status == adxl::TIMEOUT) {
+            LOG(ERROR) << "Transfer timeout to: " << target_adxl_engine_name
+                       << ", errmsg: " << aclGetRecentErrMsg();
+        } else {
+            LOG(ERROR) << "Transfer failed to: " << target_adxl_engine_name
+                       << ", errmsg: " << aclGetRecentErrMsg();
+        }
+        markSlicesFailed(group_slices);
     }
-    if (result.status == adxl::TIMEOUT) {
-        LOG(ERROR) << "Transfer timeout to: " << target_adxl_engine_name
-                   << ", errmsg: " << aclGetRecentErrMsg();
-    } else {
-        LOG(ERROR) << "Transfer failed to: " << target_adxl_engine_name
-                   << ", errmsg: " << aclGetRecentErrMsg();
-    }
-    markSlicesFailed(slice_list);
 }
 }  // namespace mooncake

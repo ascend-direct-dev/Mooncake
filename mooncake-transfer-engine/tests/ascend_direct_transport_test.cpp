@@ -319,6 +319,9 @@ static std::deque<adxl::Status> g_transfer_results;
 static std::deque<adxl::Status> g_transfer_async_results;
 static std::vector<uintptr_t> g_registered_mem_handles;
 static std::vector<uintptr_t> g_deregistered_mem_handles;
+static std::vector<std::pair<uintptr_t, size_t>> g_registered_mem_descs;
+static std::vector<std::string> g_transfer_remote_engines;
+static std::vector<std::string> g_transfer_async_remote_engines;
 static std::set<std::string> g_connected;
 static std::mutex g_mutex;
 static bool g_was_initialize_called = false;
@@ -344,6 +347,9 @@ void reset() {
     g_transfer_async_results.clear();
     g_registered_mem_handles.clear();
     g_deregistered_mem_handles.clear();
+    g_registered_mem_descs.clear();
+    g_transfer_remote_engines.clear();
+    g_transfer_async_remote_engines.clear();
     g_connected.clear();
     g_was_initialize_called = false;
     g_next_handle = 1;
@@ -446,6 +452,21 @@ std::vector<uintptr_t> get_deregistered_mem_handles() {
     std::lock_guard<std::mutex> lock(g_mutex);
     return g_deregistered_mem_handles;
 }
+
+std::vector<std::pair<uintptr_t, size_t>> get_registered_mem_descs() {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    return g_registered_mem_descs;
+}
+
+std::vector<std::string> get_transfer_remote_engines() {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    return g_transfer_remote_engines;
+}
+
+std::vector<std::string> get_transfer_async_remote_engines() {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    return g_transfer_async_remote_engines;
+}
 }  // namespace adxl_mock
 
 }  // namespace
@@ -491,12 +512,13 @@ Status AdxlEngine::TransferSync(const AscendString& remote_engine,
                                 TransferOp operation,
                                 const std::vector<TransferOpDesc>& op_descs,
                                 int32_t timeout_in_millis) {
-    (void)remote_engine;
     (void)timeout_in_millis;
 
     adxl::Status result;
     {
         std::lock_guard<std::mutex> lock(g_mutex);
+        g_transfer_remote_engines.push_back(
+            std::string(remote_engine.GetString()));
         g_transfer_count++;
         if (!g_transfer_results.empty()) {
             result = g_transfer_results.front();
@@ -517,7 +539,6 @@ Status AdxlEngine::TransferAsync(const AscendString& remote_engine,
                                  const std::vector<TransferOpDesc>& op_descs,
                                  const TransferArgs& optional_args,
                                  TransferReq& req) {
-    (void)remote_engine;
     (void)operation;
     (void)op_descs;
     (void)optional_args;
@@ -525,6 +546,8 @@ Status AdxlEngine::TransferAsync(const AscendString& remote_engine,
     adxl::Status result;
     {
         std::lock_guard<std::mutex> lock(g_mutex);
+        g_transfer_async_remote_engines.push_back(
+            std::string(remote_engine.GetString()));
         g_transfer_async_count++;
         if (!g_transfer_async_results.empty()) {
             result = g_transfer_async_results.front();
@@ -557,7 +580,6 @@ Status AdxlEngine::GetTransferStatus(const TransferReq& req,
 
 Status AdxlEngine::RegisterMem(const MemDesc& mem, MemType type,
                                MemHandle& mem_handle) {
-    (void)mem;
     (void)type;
     std::lock_guard<std::mutex> lock(g_mutex);
     g_register_mem_count++;
@@ -567,6 +589,7 @@ Status AdxlEngine::RegisterMem(const MemDesc& mem, MemType type,
     mem_handle =
         reinterpret_cast<MemHandle>(static_cast<uintptr_t>(g_next_handle++));
     g_registered_mem_handles.push_back(reinterpret_cast<uintptr_t>(mem_handle));
+    g_registered_mem_descs.emplace_back(mem.addr, mem.len);
     return SUCCESS;
 }
 
@@ -643,6 +666,28 @@ class AscendDirectTransportTest : public ::testing::Test {
         remote_desc->rank_info.endpoints.push_back(s.host_ip + ":" +
                                                    std::to_string(s.port));
         meta->addLocalSegment(s.segment_id, s.name, std::move(remote_desc));
+    }
+
+    void addRemoteRoceStoreSegment(std::shared_ptr<TransferMetadata> meta,
+                                   int segment_id, const std::string& host_ip,
+                                   uint16_t base_port, uint64_t store_base,
+                                   size_t store_size, int engine_count,
+                                   const std::string& segment_name =
+                                       "remote_roce_store") {
+        auto remote_desc = std::make_shared<TransferMetadata::SegmentDesc>();
+        remote_desc->name = segment_name;
+        remote_desc->protocol = "ascend";
+        TransferMetadata::BufferDesc buffer;
+        // ascend store mounts its global segment with the wildcard location.
+        buffer.name = "*";
+        buffer.addr = store_base;
+        buffer.length = store_size;
+        remote_desc->buffers.push_back(buffer);
+        for (int i = 0; i < engine_count; ++i) {
+            remote_desc->rank_info.endpoints.push_back(
+                host_ip + ":" + std::to_string(base_port + i));
+        }
+        meta->addLocalSegment(segment_id, segment_name, std::move(remote_desc));
     }
 
     std::shared_ptr<TransferMetadata> startRemoteMetadataServer(
@@ -1173,6 +1218,17 @@ TEST_F(AscendDirectTransportTest,
               0);
     EXPECT_EQ(adxl_mock::get_register_mem_count(), kEngineCount);
 
+    const size_t segment_size = kRegisterMemSize / kEngineCount;
+    const uintptr_t store_base = reinterpret_cast<uintptr_t>(store_buffer);
+    auto registered_descs = adxl_mock::get_registered_mem_descs();
+    ASSERT_EQ(registered_descs.size(), static_cast<size_t>(kEngineCount));
+    for (int i = 0; i < kEngineCount; ++i) {
+        EXPECT_EQ(registered_descs[static_cast<size_t>(i)].first,
+                  store_base + static_cast<size_t>(i) * segment_size);
+        EXPECT_EQ(registered_descs[static_cast<size_t>(i)].second,
+                  segment_size);
+    }
+
     ASSERT_EQ(transport->unregisterLocalMemory(store_buffer, true), 0);
     EXPECT_EQ(adxl_mock::get_deregister_mem_count(), kEngineCount);
 
@@ -1183,6 +1239,50 @@ TEST_F(AscendDirectTransportTest,
     EXPECT_EQ(deregistered_handles, registered_handles);
 
     ascend_free_memory("ascend", store_buffer);
+    unsetenv("HCCL_INTRA_ROCE_ENABLE");
+    globalConfig().ascend_agent_mode = false;
+}
+
+TEST_F(AscendDirectTransportTest,
+       DummyReal_Roce_RemoteTransfer_UsesDstSegmentEngine) {
+    globalConfig().ascend_agent_mode = true;
+    ContextManager::getInstance().finalize();
+    constexpr int kEngineCount = 4;
+    mock_acl::set_device_count(kEngineCount);
+    ASSERT_TRUE(ContextManager::getInstance().initialize());
+    setenv("HCCL_INTRA_ROCE_ENABLE", "1", 1);
+
+    auto transport = createTransport();
+    ASSERT_NE(transport, nullptr);
+
+    ASSERT_EQ(transport->registerLocalMemory(test_buffer_src_, kRegisterMemSize,
+                                             "cpu:0", true, true),
+              0);
+
+    constexpr uint64_t kRemoteStoreBase = 0x40000000ULL;
+    constexpr size_t kRemoteStoreSize = kRegisterMemSize * kEngineCount;
+    constexpr uint16_t kRemoteBasePort = 40000;
+    const std::string remote_host = "192.168.1.200";
+    addRemoteRoceStoreSegment(transport->meta(), 1, remote_host, kRemoteBasePort,
+                              kRemoteStoreBase, kRemoteStoreSize, kEngineCount);
+
+    initTestData(kTransferBufSize);
+    const size_t segment_size = kRemoteStoreSize / kEngineCount;
+    constexpr int kTargetSegment = 2;
+    const uint64_t target_offset =
+        kRemoteStoreBase + static_cast<uint64_t>(kTargetSegment) * segment_size;
+    const std::string expected_remote_engine =
+        remote_host + ":" + std::to_string(kRemoteBasePort + kTargetSegment);
+
+    auto result = runRemoteTransfer(transport.get(), test_buffer_src_, 1,
+                                    target_offset, kTransferBufSize);
+    ASSERT_TRUE(result.finished);
+    EXPECT_FALSE(result.failed);
+
+    auto remote_engines = adxl_mock::get_transfer_remote_engines();
+    ASSERT_FALSE(remote_engines.empty());
+    EXPECT_EQ(remote_engines.back(), expected_remote_engine);
+
     unsetenv("HCCL_INTRA_ROCE_ENABLE");
     globalConfig().ascend_agent_mode = false;
 }

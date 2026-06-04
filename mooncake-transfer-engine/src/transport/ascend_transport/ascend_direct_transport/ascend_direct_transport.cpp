@@ -19,14 +19,17 @@
 
 #include <glog/logging.h>
 
+#include <algorithm>
 #include <cassert>
+#include <cstdint>
 #include <memory>
 #include <numeric>
 #include <string>
 #include <random>
+#include <vector>
 
 #include "ascend_allocator.h"
-#include "common.h"
+#include "common.h"  // LOCAL_SEGMENT_ID
 #include "config.h"
 #include "transfer_engine.h"
 #include "transfer_metadata.h"
@@ -47,18 +50,143 @@ int32_t ResolveCurrentEngineId(bool dummy_real_mode) {
     return current_device_id;
 }
 
-void InitializeSlice(const Transport::TransferRequest &request,
-                     int32_t current_engine_id, Transport::TransferTask *task,
-                     Transport::Slice *slice) {
-    slice->source_addr = request.source;
-    slice->length = request.length;
+struct RemoteStoreSegmentLayout {
+    bool valid = false;
+    uint64_t buffer_base = 0;
+    size_t buffer_size = 0;
+    size_t num_engines = 0;
+};
+
+// The real node mounts its host store segment with location "cpu*" or, for the
+// ascend protocol, the wildcard location "*" (see real_client setup). Both must
+// be treated as host store so the initiator's segment routing stays consistent
+// with the target's per-engine split in registerMem.
+bool IsHostStoreBufferName(const std::string &name) {
+    return name.starts_with("cpu") || name == "*";
+}
+
+RemoteStoreSegmentLayout ResolveRemoteStoreSegmentLayout(
+    Transport::SegmentID target_id,
+    const std::shared_ptr<TransferMetadata::SegmentDesc> &segment_desc,
+    uint64_t remote_addr, size_t length, bool roce_mode, bool dummy_real_mode) {
+    RemoteStoreSegmentLayout layout;
+    if (target_id == LOCAL_SEGMENT_ID || !segment_desc || !roce_mode ||
+        !dummy_real_mode) {
+        return layout;
+    }
+    const auto &endpoints = segment_desc->rank_info.endpoints;
+    if (endpoints.size() <= 1) {
+        return layout;
+    }
+    layout.num_engines = endpoints.size();
+
+    const uintptr_t range_start = remote_addr;
+    const uintptr_t range_end = range_start + length;
+    for (const auto &buffer : segment_desc->buffers) {
+        if (!IsHostStoreBufferName(buffer.name)) {
+            continue;
+        }
+        const uintptr_t buf_start = buffer.addr;
+        const uintptr_t buf_end = buf_start + buffer.length;
+        if (range_start >= buf_start && range_end <= buf_end) {
+            if (buffer.length % layout.num_engines != 0) {
+                LOG(ERROR) << "Remote store buffer size " << buffer.length
+                           << " is not divisible by engine count "
+                           << layout.num_engines;
+                return RemoteStoreSegmentLayout{};
+            }
+            layout.valid = true;
+            layout.buffer_base = buffer.addr;
+            layout.buffer_size = static_cast<size_t>(buffer.length);
+            return layout;
+        }
+    }
+    return layout;
+}
+
+struct TransferSliceSpec {
+    void *source = nullptr;
+    size_t length = 0;
+    uint64_t dest_addr = 0;
+    int32_t dst_engine_id = -1;
+};
+
+std::vector<TransferSliceSpec> BuildTransferSliceSpecs(
+    const Transport::TransferRequest &request,
+    const RemoteStoreSegmentLayout &layout) {
+    std::vector<TransferSliceSpec> specs;
+    if (!layout.valid) {
+        TransferSliceSpec spec;
+        spec.source = request.source;
+        spec.length = request.length;
+        spec.dest_addr = request.target_offset;
+        spec.dst_engine_id = -1;
+        specs.push_back(spec);
+        return specs;
+    }
+
+    const size_t segment_size = layout.buffer_size / layout.num_engines;
+    const uintptr_t remote_start = request.target_offset;
+    const uintptr_t remote_end = remote_start + request.length;
+    const uintptr_t source_base =
+        reinterpret_cast<uintptr_t>(request.source);
+
+    uintptr_t cur = remote_start;
+    while (cur < remote_end) {
+        const size_t offset_in_buffer = cur - layout.buffer_base;
+        const size_t seg_idx = offset_in_buffer / segment_size;
+        const uintptr_t seg_end =
+            layout.buffer_base + (seg_idx + 1) * segment_size;
+        const uintptr_t chunk_end = std::min(remote_end, seg_end);
+        const size_t chunk_len = chunk_end - cur;
+
+        TransferSliceSpec spec;
+        spec.source = reinterpret_cast<void *>(source_base + (cur - remote_start));
+        spec.length = chunk_len;
+        spec.dest_addr = cur;
+        spec.dst_engine_id = static_cast<int32_t>(seg_idx);
+        specs.push_back(spec);
+        cur = chunk_end;
+    }
+    return specs;
+}
+
+void InitializeSliceFromSpec(const TransferSliceSpec &spec,
+                             const Transport::TransferRequest &request,
+                             int32_t current_engine_id,
+                             Transport::TransferTask *task,
+                             Transport::Slice *slice) {
+    slice->source_addr = spec.source;
+    slice->length = spec.length;
     slice->opcode = request.opcode;
     slice->target_id = request.target_id;
-    slice->ascend_direct.dest_addr = request.target_offset;
+    slice->ascend_direct.dest_addr = spec.dest_addr;
     slice->ascend_direct.engine_id = current_engine_id;
+    slice->ascend_direct.dst_engine_id = spec.dst_engine_id;
     slice->task = task;
     slice->status = Transport::Slice::PENDING;
     slice->ts = 0;
+    slice->ascend_direct.handle = nullptr;
+    slice->ascend_direct.start_time = 0;
+}
+
+void AppendSlicesForRequest(
+    const Transport::TransferRequest &request, int32_t current_engine_id,
+    TransferMetadata *metadata, bool roce_mode, bool dummy_real_mode,
+    Transport::TransferTask *task, Transport::ThreadLocalSliceCache &slice_cache,
+    std::vector<Transport::Slice *> &slice_list) {
+    auto segment_desc = metadata->getSegmentDescByID(request.target_id);
+    const auto layout = ResolveRemoteStoreSegmentLayout(
+        request.target_id, segment_desc, request.target_offset, request.length,
+        roce_mode, dummy_real_mode);
+    const auto specs = BuildTransferSliceSpecs(request, layout);
+    for (const auto &spec : specs) {
+        Transport::Slice *slice = slice_cache.allocate();
+        InitializeSliceFromSpec(spec, request, current_engine_id, task, slice);
+        task->slice_list.push_back(slice);
+        __sync_fetch_and_add(&task->slice_count, 1);
+        slice_list.push_back(slice);
+    }
 }
 
 }  // namespace
@@ -238,11 +366,9 @@ Status AscendDirectTransport::submitTransfer(
         TransferTask &task = batch_desc.task_list[cur_task_size];
         ++cur_task_size;
         task.total_bytes = request.length;
-        Slice *slice = getSliceCache().allocate();
-        InitializeSlice(request, current_engine_id, &task, slice);
-        task.slice_list.push_back(slice);
-        __sync_fetch_and_add(&task.slice_count, 1);
-        slice_list.push_back(slice);
+        AppendSlicesForRequest(request, current_engine_id, metadata_.get(),
+                               roce_mode_, dummy_real_mode_, &task,
+                               getSliceCache(), slice_list);
     }
     if (dispatcher_) {
         dispatcher_->enqueue(std::move(slice_list));
@@ -266,11 +392,9 @@ Status AscendDirectTransport::submitTransferTask(
         assert(task.request);
         auto &request = *task.request;
         task.total_bytes = request.length;
-        Slice *slice = getSliceCache().allocate();
-        InitializeSlice(request, current_engine_id, &task, slice);
-        task.slice_list.push_back(slice);
-        __sync_fetch_and_add(&task.slice_count, 1);
-        slice_list.push_back(slice);
+        AppendSlicesForRequest(request, current_engine_id, metadata_.get(),
+                               roce_mode_, dummy_real_mode_, &task,
+                               getSliceCache(), slice_list);
     }
 
     if (dispatcher_) {

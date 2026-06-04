@@ -117,8 +117,11 @@ TransferExecutorBase::ExecuteResult AsyncTransferExecutor::execute(
     if (status == adxl::SUCCESS) {
         {
             std::lock_guard<std::mutex> lock(async_handle_map_mutex_);
-            async_handle_to_engine_idx_[reinterpret_cast<uintptr_t>(
-                req_handle)] = local_engine_idx;
+            const uintptr_t handle_key =
+                reinterpret_cast<uintptr_t>(req_handle);
+            async_handle_to_engine_idx_[handle_key] = local_engine_idx;
+            async_handle_to_target_engine_[handle_key] =
+                target_adxl_engine_name;
         }
         for (auto* slice : slice_list) {
             slice->ascend_direct.handle = req_handle;
@@ -193,13 +196,18 @@ bool AsyncTransferExecutor::processOneBatch(
         static_cast<adxl::TransferReq>(slice_list[0]->ascend_direct.handle);
     size_t engine_idx = 0;
     bool found_engine_idx = false;
+    std::string target_adxl_engine_name;
     {
         std::lock_guard<std::mutex> lock(async_handle_map_mutex_);
-        auto it_handle = async_handle_to_engine_idx_.find(
-            reinterpret_cast<uintptr_t>(handle));
+        const uintptr_t handle_key = reinterpret_cast<uintptr_t>(handle);
+        auto it_handle = async_handle_to_engine_idx_.find(handle_key);
         if (it_handle != async_handle_to_engine_idx_.end()) {
             engine_idx = it_handle->second;
             found_engine_idx = true;
+        }
+        auto it_target = async_handle_to_target_engine_.find(handle_key);
+        if (it_target != async_handle_to_target_engine_.end()) {
+            target_adxl_engine_name = it_target->second;
         }
     }
 
@@ -228,19 +236,25 @@ bool AsyncTransferExecutor::processOneBatch(
             "Invalid async engine index: " + std::to_string(engine_idx), "");
     }
 
-    auto target_segment_desc =
-        metadata_->getSegmentDescByID(slice_list[0]->target_id);
-    if (!target_segment_desc) {
-        return fail_batch(
-            "Cannot find target segment descriptor for target_id: " +
-                std::to_string(slice_list[0]->target_id),
-            "");
-    }
-
-    std::string target_adxl_engine_name =
-        resolveTargetAdxlEngineName(target_segment_desc, engine_idx);
     if (target_adxl_engine_name.empty()) {
-        return fail_batch("Cannot resolve target adxl engine name", "");
+        auto target_segment_desc =
+            metadata_->getSegmentDescByID(slice_list[0]->target_id);
+        if (!target_segment_desc) {
+            return fail_batch(
+                "Cannot find target segment descriptor for target_id: " +
+                    std::to_string(slice_list[0]->target_id),
+                "");
+        }
+        size_t remote_engine_idx = engine_idx;
+        if (slice_list[0]->ascend_direct.dst_engine_id >= 0) {
+            remote_engine_idx = static_cast<size_t>(
+                slice_list[0]->ascend_direct.dst_engine_id);
+        }
+        target_adxl_engine_name =
+            resolveTargetAdxlEngineName(target_segment_desc, remote_engine_idx);
+        if (target_adxl_engine_name.empty()) {
+            return fail_batch("Cannot resolve target adxl engine name", "");
+        }
     }
 
     auto context_ret =
@@ -286,7 +300,9 @@ bool AsyncTransferExecutor::processOneBatch(
 
 void AsyncTransferExecutor::handleTaskFinished(adxl::TransferReq handle) {
     std::lock_guard<std::mutex> handle_lock(async_handle_map_mutex_);
-    async_handle_to_engine_idx_.erase(reinterpret_cast<uintptr_t>(handle));
+    const uintptr_t handle_key = reinterpret_cast<uintptr_t>(handle);
+    async_handle_to_engine_idx_.erase(handle_key);
+    async_handle_to_target_engine_.erase(handle_key);
     std::lock_guard<std::mutex> lock(async_task_mutex_);
     if (active_async_tasks_ > 0) {
         active_async_tasks_--;

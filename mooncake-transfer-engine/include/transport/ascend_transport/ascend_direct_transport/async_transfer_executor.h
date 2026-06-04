@@ -63,6 +63,7 @@ class AsyncTransferExecutor : public TransferExecutorBase {
     std::condition_variable async_task_cv_;
     std::mutex async_handle_map_mutex_;
     std::unordered_map<uintptr_t, size_t> async_handle_to_engine_idx_;
+    std::unordered_map<uintptr_t, std::string> async_handle_to_target_engine_;
     bool finalized_{false};
 };
 
