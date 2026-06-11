@@ -277,6 +277,10 @@ bool MasterAdminServer::Start() {
 
     started_.store(true);
     if (enable_metric_reporting_) {
+        {
+            std::lock_guard<std::mutex> lock(metric_report_mutex_);
+            metric_report_stop_requested_ = false;
+        }
         metric_report_running_.store(true);
         metric_report_thread_ = std::thread([this]() {
             while (metric_report_running_.load()) {
@@ -302,9 +306,14 @@ bool MasterAdminServer::Start() {
                         << snapshot.leader_view->view_version;
                 }
                 LOG(INFO) << log_stream.str();
-                if (metric_report_stop_sem_.try_acquire_for(
-                        std::chrono::seconds(kMetricReportIntervalSeconds))) {
-                    break;
+                {
+                    std::unique_lock<std::mutex> lock(metric_report_mutex_);
+                    if (metric_report_cv_.wait_for(
+                            lock,
+                            std::chrono::seconds(kMetricReportIntervalSeconds),
+                            [this] { return metric_report_stop_requested_; })) {
+                        break;
+                    }
                 }
             }
         });
@@ -320,7 +329,11 @@ void MasterAdminServer::Stop() {
         http_server_.stop();
     }
     if (metric_report_thread_.joinable()) {
-        metric_report_stop_sem_.release();
+        {
+            std::lock_guard<std::mutex> lock(metric_report_mutex_);
+            metric_report_stop_requested_ = true;
+        }
+        metric_report_cv_.notify_all();
         metric_report_thread_.join();
     }
 }

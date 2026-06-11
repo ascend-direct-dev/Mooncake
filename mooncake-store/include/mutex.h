@@ -116,37 +116,39 @@ class CAPABILITY("shared_mutex") SharedMutex {
     const SharedMutex& operator!() const { return *this; }
 };
 
-// Simple spin lock implementation using std::atomic_flag for exclusive locking
-// only.
+// Simple spin lock implementation using std::atomic<bool> for exclusive
+// locking only. std::atomic<bool> is used instead of std::atomic_flag because
+// reading an atomic_flag via test() requires C++20, while this code must also
+// build under gcc 10 / C++17.
 class CAPABILITY("mutex") SpinLock {
    private:
-    std::atomic_flag flag = ATOMIC_FLAG_INIT;
+    std::atomic<bool> flag{false};
 
    public:
     // Acquire/lock the spinlock.
     void lock() ACQUIRE() {
         // Fast path: try to acquire directly
-        if (!flag.test_and_set(std::memory_order_acquire)) return;
+        if (!flag.exchange(true, std::memory_order_acquire)) return;
 
         // Slow path: spin wait with relaxed loads, acquire on success
         do {
-            while (flag.test(std::memory_order_relaxed)) {
+            while (flag.load(std::memory_order_relaxed)) {
                 PAUSE();
             }
-        } while (flag.test_and_set(std::memory_order_acquire));
+        } while (flag.exchange(true, std::memory_order_acquire));
     }
 
     // Try to acquire the spinlock. Returns true on success, and false on
     // failure.
     bool try_lock() TRY_ACQUIRE(true) {
-        return !flag.test_and_set(std::memory_order_acquire);
+        return !flag.exchange(true, std::memory_order_acquire);
     }
 
     // Release the spinlock.
-    void unlock() RELEASE() { flag.clear(std::memory_order_release); }
+    void unlock() RELEASE() { flag.store(false, std::memory_order_release); }
 
     // Check whether the spinlock is locked.
-    bool is_locked() const { return flag.test(std::memory_order_relaxed); }
+    bool is_locked() const { return flag.load(std::memory_order_relaxed); }
 };
 
 // MutexLocker is an RAII class that acquires a mutex in its constructor, and

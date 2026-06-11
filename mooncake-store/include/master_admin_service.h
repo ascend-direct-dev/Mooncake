@@ -3,11 +3,11 @@
 #include <csignal>
 
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <memory>
 #include <mutex>
 #include <optional>
-#include <semaphore>
 #include <string>
 #include <thread>
 
@@ -111,7 +111,12 @@ class MasterAdminServer {
     coro_http::coro_http_server http_server_;
     std::thread metric_report_thread_;
     std::atomic<bool> metric_report_running_{false};
-    std::binary_semaphore metric_report_stop_sem_{0};
+    // Used to wake the metric-report thread early when the server stops.
+    // Replaces a std::binary_semaphore (C++20) so the code builds under
+    // gcc 10 / C++17.
+    std::mutex metric_report_mutex_;
+    std::condition_variable metric_report_cv_;
+    bool metric_report_stop_requested_ = false;
     std::atomic<bool> started_{false};
     mutable std::mutex state_mutex_;
     ha::MasterRuntimeState state_{ha::MasterRuntimeState::kStarting};
