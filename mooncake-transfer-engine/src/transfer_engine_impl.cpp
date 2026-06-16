@@ -192,7 +192,7 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
     int ret = metadata_->addRpcMetaEntry(local_server_name_, desc);
     if (ret) return ret;
 
-#if defined(USE_ASCEND) || defined(USE_ASCEND_DIRECT)
+#ifdef USE_ASCEND
     Transport* ascend_transport =
         multi_transports_->installTransport("ascend", local_topology_);
     if (!ascend_transport) {
@@ -200,9 +200,22 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
         return -1;
     }
 #else
+#if defined(USE_ASCEND_DIRECT)
+    const bool auto_install_ascend =
+        local_protocol_hint_ == "ascend" ||
+        local_protocol_hint_ == "ascend_direct" ||
+        (local_protocol_hint_.empty() && !auto_discover_);
+    if (auto_install_ascend) {
+        Transport* ascend_transport =
+            multi_transports_->installTransport("ascend", local_topology_);
+        if (!ascend_transport) {
+            LOG(ERROR) << "Failed to install Ascend transport";
+            return -1;
+        }
+    }
+#endif
 
-#if defined(USE_CXL) && !defined(USE_ASCEND) && \
-    !defined(USE_ASCEND_HETEROGENEOUS)
+#if defined(USE_CXL) && !defined(USE_ASCEND_HETEROGENEOUS)
     if (std::getenv("MC_CXL_DEV_PATH") != nullptr) {
         Transport* cxl_transport =
             multi_transports_->installTransport("cxl", local_topology_);

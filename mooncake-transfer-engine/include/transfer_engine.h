@@ -111,6 +111,8 @@ class TransferEngine {
 
     void setAutoDiscover(bool auto_discover);
 
+    void setLocalProtocolHint(const std::string& protocol);
+
     void* getBaseAddr();
 
     void setWhitelistFilters(std::vector<std::string>&& filters);

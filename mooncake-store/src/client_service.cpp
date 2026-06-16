@@ -256,6 +256,7 @@ ErrorCode Client::InitTransferEngine(
             }
         }
         transfer_engine_->setAutoDiscover(auto_discover);
+        transfer_engine_->setLocalProtocolHint(protocol);
 
         // Honor filters when auto-discovery is enabled; otherwise warn once
         if (auto_discover) {

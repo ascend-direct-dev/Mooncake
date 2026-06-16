@@ -45,20 +45,17 @@ if (WITH_TE)
 
     target_link_libraries(engine PRIVATE ${Python3_LIBRARIES})
     target_include_directories(engine PRIVATE ${Python3_INCLUDE_DIRS})
-    if (USE_ASCEND_DIRECT)
-        target_link_libraries(engine PUBLIC
-            ascendcl
-            transfer_engine
-            glog::glog
-            gflags::gflags
-        )
-    else()
-        target_link_libraries(engine PUBLIC
-            transfer_engine
-            glog::glog
-            gflags::gflags
-        )
-    endif()
+    # Do NOT link `ascendcl` directly into the engine module, even for
+    # USE_ASCEND_DIRECT. ACL symbols resolve transitively via
+    # transfer_engine -> ascend_transport -> libascendcl. Making libascendcl a
+    # direct DT_NEEDED of this dlopen'd module reorders the dynamic-linker fini
+    # sequence and makes the bare `import mooncake.engine` abort at exit with a
+    # "corrupted size vs. prev_size" heap error from CANN libascend_trace.
+    target_link_libraries(engine PUBLIC
+        transfer_engine
+        glog::glog
+        gflags::gflags
+    )
 
     if (USE_CUDA)
         find_package(CUDAToolkit REQUIRED)

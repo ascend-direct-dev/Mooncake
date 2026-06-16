@@ -279,6 +279,10 @@ class TransferEngineImpl {
 
     void setAutoDiscover(bool auto_discover) { auto_discover_ = auto_discover; }
 
+    void setLocalProtocolHint(const std::string& protocol) {
+        local_protocol_hint_ = protocol;
+    }
+
     void* getBaseAddr() { return multi_transports_->getBaseAddr(); }
 
     void setWhitelistFilters(std::vector<std::string>&& filters) {
@@ -316,6 +320,8 @@ class TransferEngineImpl {
     // Discover topology and install transports automatically when it's true.
     // Set it to false only for testing.
     bool auto_discover_;
+    // Runtime hint for which local transport to auto-install at init().
+    std::string local_protocol_hint_;
     std::vector<std::string> filter_;
     bool use_barex_ = false;
 

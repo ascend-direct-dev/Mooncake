@@ -199,6 +199,12 @@ class TransferEnginePy {
     std::unordered_set<char *> large_buffer_list_;
     std::unordered_map<std::string, Transport::SegmentHandle> handle_map_;
     bool auto_discovery_;
+    bool use_ascend_direct_{false};
 
     uint64_t transfer_timeout_nsec_;
+#ifdef USE_ASCEND_DIRECT
+    std::vector<void *> ascend_npu_buffers_;
+
+    void cleanupAscendResources();
+#endif
 };

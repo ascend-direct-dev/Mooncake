@@ -17,6 +17,8 @@
 #include <cassert>
 #include <numeric>
 #include <fstream>
+#include <algorithm>
+#include <cstring>
 
 #include <pybind11/stl.h>
 #include "transport/rpc_communicator/rpc_interface.h"
@@ -31,6 +33,10 @@
 
 #ifdef USE_CUDA
 #include <cuda_runtime.h>
+#endif
+
+#ifdef USE_ASCEND_DIRECT
+#include "acl/acl.h"
 #endif
 
 static void *(*allocateMemory)(size_t) = nullptr;
@@ -78,6 +84,37 @@ void initMemoryAllocator(const char *protocol) {
     }
 }
 
+#ifdef USE_ASCEND_DIRECT
+static bool isAscendDirectProtocol(const char *protocol) {
+    return protocol != nullptr &&
+           (strcmp(protocol, "ascend_direct") == 0 ||
+            strcmp(protocol, "ascend") == 0);
+}
+
+static int currentAscendDeviceId() {
+    int32_t device_id = 0;
+    aclError ret = aclrtGetDevice(&device_id);
+    if (ret != ACL_ERROR_NONE) {
+        LOG(ERROR) << "aclrtGetDevice failed, ret=" << ret
+                   << ". Set NPU device in user code before initialize().";
+        return -1;
+    }
+    return device_id;
+}
+
+void TransferEnginePy::cleanupAscendResources() {
+    if (engine_) {
+        for (void *buffer : ascend_npu_buffers_) {
+            engine_->unregisterLocalMemory(buffer);
+        }
+    }
+    for (void *buffer : ascend_npu_buffers_) {
+        aclrtFree(buffer);
+    }
+    ascend_npu_buffers_.clear();
+}
+#endif
+
 TransferEnginePy::TransferEnginePy() {
     const int64_t kNanosPerSecond = 1000 * 1000 * 1000;
     if (getenv("MC_TRANSFER_TIMEOUT")) {
@@ -91,6 +128,9 @@ TransferEnginePy::TransferEnginePy() {
 TransferEnginePy::~TransferEnginePy() {
     for (auto &handle : handle_map_) engine_->closeSegment(handle.second);
     handle_map_.clear();
+#ifdef USE_ASCEND_DIRECT
+    cleanupAscendResources();
+#endif
     engine_.reset();
     for (auto &buffer : buffer_list_) freeMemory(buffer);
     buffer_list_.clear();
@@ -146,8 +186,6 @@ int TransferEnginePy::initialize(const char *local_hostname,
                                  const char *metadata_server,
                                  const char *protocol,
                                  const char *device_name) {
-    initMemoryAllocator(protocol);
-
     auto conn_string = parseConnectionString(metadata_server);
     return initializeExt(local_hostname, conn_string.second.c_str(), protocol,
                          device_name, conn_string.first.c_str());
@@ -158,12 +196,29 @@ int TransferEnginePy::initializeExt(const char *local_hostname,
                                     const char *protocol,
                                     const char *device_name,
                                     const char *metadata_type) {
-    (void)(protocol);
     std::string conn_string = buildConnString(metadata_type, metadata_server);
 
     auto device_name_safe = device_name ? std::string(device_name) : "";
+
+#ifdef USE_ASCEND_DIRECT
+    use_ascend_direct_ = isAscendDirectProtocol(protocol);
+#endif
+
+    if (allocateMemory == nullptr) {
+        initMemoryAllocator(protocol);
+    }
+
     auto device_filter = buildDeviceFilter(device_name_safe);
+#ifdef USE_ASCEND_DIRECT
+    if (use_ascend_direct_) {
+        engine_ = std::make_unique<TransferEngine>(false);
+        engine_->setLocalProtocolHint("ascend_direct");
+    } else {
+        engine_ = std::make_unique<TransferEngine>(true, device_filter);
+    }
+#else
     engine_ = std::make_unique<TransferEngine>(true, device_filter);
+#endif
     if (getenv("MC_LEGACY_RPC_PORT_BINDING")) {
         auto hostname_port = parseHostNameWithPort(local_hostname);
         int ret =
@@ -171,7 +226,6 @@ int TransferEnginePy::initializeExt(const char *local_hostname,
                           hostname_port.first.c_str(), hostname_port.second);
         if (ret) return -1;
     } else {
-        // the last two params are unused
         int ret = engine_->init(conn_string, local_hostname, "", 0);
         if (ret) return -1;
     }
@@ -183,6 +237,27 @@ int TransferEnginePy::initializeExt(const char *local_hostname,
 int TransferEnginePy::getRpcPort() { return engine_->getRpcPort(); }
 
 char *TransferEnginePy::allocateRawBuffer(size_t capacity) {
+#ifdef USE_ASCEND_DIRECT
+    if (use_ascend_direct_) {
+        int device_id = currentAscendDeviceId();
+        if (device_id < 0) return nullptr;
+        void *dev_addr = nullptr;
+        aclError ret =
+            aclrtMalloc(&dev_addr, capacity, ACL_MEM_MALLOC_HUGE_ONLY);
+        if (ret != ACL_ERROR_NONE) {
+            LOG(ERROR) << "aclrtMalloc failed, ret=" << ret;
+            return nullptr;
+        }
+        std::string location = "npu:" + std::to_string(device_id);
+        ret = engine_->registerLocalMemory(dev_addr, capacity, location);
+        if (ret) {
+            aclrtFree(dev_addr);
+            return nullptr;
+        }
+        ascend_npu_buffers_.push_back(dev_addr);
+        return static_cast<char *>(dev_addr);
+    }
+#endif
     auto buffer = allocateMemory(capacity);
     if (!buffer) return nullptr;
     int ret = engine_->registerLocalMemory(buffer, capacity, kWildcardLocation);
@@ -690,6 +765,14 @@ int TransferEnginePy::batchUnregisterMemory(
 
 int TransferEnginePy::registerMemory(uintptr_t buffer_addr, size_t capacity) {
     char *buffer = reinterpret_cast<char *>(buffer_addr);
+#ifdef USE_ASCEND_DIRECT
+    if (use_ascend_direct_) {
+        int device_id = currentAscendDeviceId();
+        if (device_id < 0) return -1;
+        std::string location = "npu:" + std::to_string(device_id);
+        return engine_->registerLocalMemory(buffer, capacity, location);
+    }
+#endif
     return engine_->registerLocalMemory(buffer, capacity);
 }
 

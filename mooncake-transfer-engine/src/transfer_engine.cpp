@@ -161,6 +161,10 @@ void TransferEngine::setAutoDiscover(bool auto_discover) {
     impl_->setAutoDiscover(auto_discover);
 }
 
+void TransferEngine::setLocalProtocolHint(const std::string& protocol) {
+    impl_->setLocalProtocolHint(protocol);
+}
+
 void* TransferEngine::getBaseAddr() { return impl_->getBaseAddr(); }
 
 void TransferEngine::setWhitelistFilters(std::vector<std::string>&& filters) {
@@ -556,6 +560,10 @@ bool TransferEngine::checkOverlap(void* addr, uint64_t length) {
 
 void TransferEngine::setAutoDiscover(bool auto_discover) {
     if (!use_tent_) impl_->setAutoDiscover(auto_discover);
+}
+
+void TransferEngine::setLocalProtocolHint(const std::string& protocol) {
+    if (!use_tent_) impl_->setLocalProtocolHint(protocol);
 }
 
 void TransferEngine::setWhitelistFilters(std::vector<std::string>&& filters) {
