@@ -1,6 +1,8 @@
 #include <pybind11/gil.h>  // For GIL management
 #include <pybind11/stl.h>
 #include <numa.h>
+#include <sys/mman.h>
+#include <unistd.h>
 
 #include "pyclient.h"
 #include "dummy_client.h"
@@ -8,13 +10,151 @@
 #include "types.h"
 
 #include <cstdlib>  // for atexit
+#include <mutex>
+#include <unordered_map>
 
 #include "integration_utils.h"
+
+#ifdef USE_ASCEND_DIRECT
+#include "acl/acl.h"
+#endif
 
 namespace py = pybind11;
 
 namespace mooncake {
 namespace {
+
+// ---- Host pinned memory: mmap (+ optional huge pages) + aclrtHostRegister ---
+//
+// torch_npu's pin_memory=True (aclrtMallocHost) maps a VM_PFNMAP|VM_IO region
+// that the standard RDMA path (ibv_reg_mr -> ib_umem_get -> GUP) refuses, so it
+// cannot be registered by RDMA transports (fails with EINVAL/EFAULT).
+//
+// Ordinary mmap memory is a normal pageable VMA, so it can be pinned by BOTH
+//   * the NPU driver  (aclrtHostRegister -> svm_pin_user_npages_fast), and
+//   * a third-party RDMA NIC (ibv_reg_mr -> ib_umem_get).
+// We allocate page-aligned host memory via mmap (optionally backed by huge
+// pages), register it to the NPU, and return the host VA. Callers can then pass
+// that VA to register_buffer() for RDMA transports.
+
+#ifndef MAP_HUGETLB
+#define MAP_HUGETLB 0x40000
+#endif
+#ifndef MAP_HUGE_SHIFT
+#define MAP_HUGE_SHIFT 26
+#endif
+#ifndef MAP_HUGE_2MB
+#define MAP_HUGE_2MB (21 << MAP_HUGE_SHIFT)
+#endif
+#ifndef MAP_HUGE_1GB
+#define MAP_HUGE_1GB (30 << MAP_HUGE_SHIFT)
+#endif
+
+struct HostPinMemBlock {
+    size_t capacity;  // actual mmap size (page-aligned)
+    bool registered;  // whether aclrtHostRegister succeeded
+};
+
+class HostPinMemRegistry {
+   public:
+    static HostPinMemRegistry &instance() {
+        static HostPinMemRegistry inst;
+        return inst;
+    }
+
+    uintptr_t alloc(size_t size, bool use_huge, bool huge_1gb) {
+        if (size == 0) {
+            LOG(ERROR) << "alloc_host_pin_mem: size must be positive";
+            return 0;
+        }
+
+        long base_page = sysconf(_SC_PAGESIZE);
+        size_t page = base_page > 0 ? static_cast<size_t>(base_page) : 4096;
+        int flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE;
+        if (use_huge) {
+            page = huge_1gb ? (1UL << 30) : (2UL << 20);
+            flags |= MAP_HUGETLB | (huge_1gb ? MAP_HUGE_1GB : MAP_HUGE_2MB);
+        }
+        size_t capacity = (size + page - 1) / page * page;
+
+        void *ptr =
+            mmap(nullptr, capacity, PROT_READ | PROT_WRITE, flags, -1, 0);
+        if (ptr == MAP_FAILED) {
+            PLOG(ERROR) << "alloc_host_pin_mem: mmap failed (size=" << capacity
+                        << ", huge=" << use_huge
+                        << "); for huge pages reserve a hugetlb pool first, "
+                           "e.g. echo N > /proc/sys/vm/nr_hugepages";
+            return 0;
+        }
+
+        bool registered = false;
+#ifdef USE_ASCEND_DIRECT
+        void *dev_ptr = nullptr;
+        auto ret = aclrtHostRegister(ptr, capacity, ACL_HOST_REGISTER_MAPPED,
+                                     &dev_ptr);
+        if (ret != ACL_ERROR_NONE) {
+            LOG(ERROR) << "alloc_host_pin_mem: aclrtHostRegister failed, ret="
+                       << ret
+                       << " (make sure an NPU device is selected via "
+                          "aclrtSetDevice / torch.npu.set_device)";
+            munmap(ptr, capacity);
+            return 0;
+        }
+        registered = true;
+#else
+        LOG(WARNING) << "alloc_host_pin_mem: built without USE_ASCEND_DIRECT, "
+                        "returning plain mmap memory (not NPU-registered)";
+#endif
+
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            blocks_[ptr] = HostPinMemBlock{capacity, registered};
+        }
+        return reinterpret_cast<uintptr_t>(ptr);
+    }
+
+    bool free(uintptr_t addr) {
+        if (addr == 0) {
+            return false;
+        }
+        void *ptr = reinterpret_cast<void *>(addr);
+        HostPinMemBlock block;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            auto it = blocks_.find(ptr);
+            if (it == blocks_.end()) {
+                LOG(ERROR) << "free_host_pin_mem: pointer not allocated by "
+                              "alloc_host_pin_mem: "
+                           << ptr;
+                return false;
+            }
+            block = it->second;
+            blocks_.erase(it);
+        }
+
+        bool ok = true;
+#ifdef USE_ASCEND_DIRECT
+        if (block.registered) {
+            auto ret = aclrtHostUnregister(ptr);
+            if (ret != ACL_ERROR_NONE) {
+                LOG(ERROR) << "free_host_pin_mem: aclrtHostUnregister failed, "
+                              "ret="
+                           << ret;
+                ok = false;
+            }
+        }
+#endif
+        if (munmap(ptr, block.capacity) != 0) {
+            PLOG(ERROR) << "free_host_pin_mem: munmap failed";
+            ok = false;
+        }
+        return ok;
+    }
+
+   private:
+    std::mutex mutex_;
+    std::unordered_map<void *, HostPinMemBlock> blocks_;
+};
 
 struct PyTensorInfo {
     uintptr_t data_ptr;
@@ -1303,6 +1443,36 @@ PYBIND11_MODULE(store, m) {
             py::arg("tp_rank") = 0, py::arg("tp_size") = 1,
             "Get a batch of PyTorch tensor shards from the store directly into "
             "pre-allocated buffers for a given Tensor Parallel rank.")
+        .def(
+            "alloc_host_pin_mem",
+            [](MooncakeStorePyWrapper &self, size_t size, bool use_huge,
+               bool huge_1gb) {
+                (void)self;
+                py::gil_scoped_release release;
+                return HostPinMemRegistry::instance().alloc(size, use_huge,
+                                                            huge_1gb);
+            },
+            py::arg("size"), py::arg("use_huge") = false,
+            py::arg("huge_1gb") = false,
+            "Allocate page-aligned host memory via mmap (optionally backed by "
+            "huge pages) and register it to the NPU via aclrtHostRegister. "
+            "Unlike torch pin_memory=True (aclrtMallocHost), the returned host "
+            "address is ordinary pageable memory, so it is BOTH NPU-pinned "
+            "(fast H2D copies) and registrable by RDMA transports: pass it to "
+            "register_buffer(). Requires an NPU device to be selected first "
+            "(aclrtSetDevice / torch.npu.set_device). Returns the host virtual "
+            "address as an integer, or 0 on failure.")
+        .def(
+            "free_host_pin_mem",
+            [](MooncakeStorePyWrapper &self, uintptr_t buffer_ptr) {
+                (void)self;
+                py::gil_scoped_release release;
+                return HostPinMemRegistry::instance().free(buffer_ptr);
+            },
+            py::arg("buffer_ptr"),
+            "Unregister (aclrtHostUnregister) and munmap a buffer previously "
+            "allocated by alloc_host_pin_mem. Unregister it from RDMA "
+            "(unregister_buffer) before calling this.")
         .def(
             "register_buffer",
             [](MooncakeStorePyWrapper &self, uintptr_t buffer_ptr,
