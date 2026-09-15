@@ -465,7 +465,7 @@ Transport* MultiTransport::installTransport(const std::string& proto,
     }
 #endif
 #ifdef USE_ASCEND_DIRECT
-    else if (std::string(proto) == "ascend") {
+    else if (std::string(proto) == "ascend" && isAscendDirectEnabled()) {
         transport = new AscendDirectTransport();
     }
 #endif
@@ -538,6 +538,19 @@ Transport* MultiTransport::installTransport(const std::string& proto,
 #endif
 
     if (!transport) {
+        if (std::string(proto) == "ascend") {
+#ifdef USE_ASCEND_DIRECT
+            if (!isAscendDirectEnabled()) {
+                LOG(ERROR) << "Ascend Direct is compiled in but disabled by "
+                              "MC_USE_ASCEND_DIRECT=0";
+                return nullptr;
+            }
+#endif
+            LOG(ERROR) << "Unsupported transport " << proto
+                       << ", rebuild with -DUSE_ASCEND_DIRECT=ON (or "
+                          "-DUSE_ASCEND=ON)";
+            return nullptr;
+        }
         LOG(ERROR) << "Unsupported transport " << proto
                    << ", please rebuild Mooncake";
         return nullptr;

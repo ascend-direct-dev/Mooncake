@@ -581,6 +581,23 @@ void loadGlobalConfig(GlobalConfig& config) {
                            config.use_rdma_twosided);
     }
 
+    const char* use_ascend_direct_env = std::getenv("MC_USE_ASCEND_DIRECT");
+    if (use_ascend_direct_env) {
+        bool requested = false;
+        if (parseBoolConfigEnv(use_ascend_direct_env, "MC_USE_ASCEND_DIRECT",
+                               requested)) {
+#ifdef USE_ASCEND_DIRECT
+            config.use_ascend_direct = requested;
+#else
+            if (requested) {
+                LOG(ERROR) << "MC_USE_ASCEND_DIRECT=1 ignored: this binary was "
+                              "built without -DUSE_ASCEND_DIRECT=ON";
+            }
+            config.use_ascend_direct = false;
+#endif
+        }
+    }
+
     const char* rdma_notify_enabled_env = std::getenv("MC_RDMA_NOTIFY_ENABLED");
     if (rdma_notify_enabled_env) {
         parseBoolConfigEnv(rdma_notify_enabled_env, "MC_RDMA_NOTIFY_ENABLED",
@@ -868,6 +885,8 @@ void dumpGlobalConfig() {
               << (config.track_rdma_posted_slices ? "true" : "false");
     LOG(INFO) << "use_rdma_twosided = "
               << (config.use_rdma_twosided ? "true" : "false");
+    LOG(INFO) << "use_ascend_direct = "
+              << (config.use_ascend_direct ? "true" : "false");
     LOG(INFO) << "rdma_notify_enabled = "
               << (config.rdma_notify_enabled ? "true" : "false");
     LOG(INFO) << "rdma_notify_recv_count = " << config.rdma_notify_recv_count;
@@ -883,6 +902,14 @@ GlobalConfig& globalConfig() {
     static std::once_flag g_once_flag;
     std::call_once(g_once_flag, []() { loadGlobalConfig(config); });
     return config;
+}
+
+bool isAscendDirectEnabled() {
+#ifdef USE_ASCEND_DIRECT
+    return globalConfig().use_ascend_direct;
+#else
+    return false;
+#endif
 }
 
 uint16_t getDefaultHandshakePort() { return globalConfig().handshake_port; }

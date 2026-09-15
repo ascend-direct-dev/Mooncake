@@ -42,6 +42,28 @@ bool overlapWithRegion(uintptr_t addr, uint64_t length, void* region_addr,
     return overlap(reinterpret_cast<void*>(addr), length, region_addr,
                    region_length);
 }
+
+#if defined(USE_ASCEND) || defined(USE_ASCEND_DIRECT)
+bool ShouldAutoInstallAscendTransport() {
+#ifdef USE_ASCEND_DIRECT
+    if (isAscendDirectEnabled()) {
+        return true;
+    }
+#endif
+#ifdef USE_ASCEND
+#ifdef USE_ASCEND_DIRECT
+    LOG(INFO) << "Ascend Direct disabled via MC_USE_ASCEND_DIRECT; "
+                 "falling back to HCCL for protocol 'ascend'";
+#endif
+    return true;
+#else
+    LOG(INFO) << "Ascend Direct is compiled in but disabled via "
+                 "MC_USE_ASCEND_DIRECT; skipping auto-install of protocol "
+                 "'ascend'";
+    return false;
+#endif
+}
+#endif
 }  // namespace
 
 static bool setFilesLimit() {
@@ -225,13 +247,16 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
     }
 
 #if defined(USE_ASCEND) || defined(USE_ASCEND_DIRECT)
-    Transport* ascend_transport =
-        multi_transports_->installTransport("ascend", local_topology_);
-    if (!ascend_transport) {
-        LOG(ERROR) << "Failed to install Ascend transport";
-        return -1;
+    if (ShouldAutoInstallAscendTransport()) {
+        Transport* ascend_transport =
+            multi_transports_->installTransport("ascend", local_topology_);
+        if (!ascend_transport) {
+            LOG(ERROR) << "Failed to install Ascend transport";
+            return -1;
+        }
+        return 0;
     }
-#else
+#endif
 
 #ifdef USE_UBSHMEM
     Transport* ubshmem_transport =
@@ -455,7 +480,6 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
         }
 #endif
     }
-#endif
 
     return 0;
 }

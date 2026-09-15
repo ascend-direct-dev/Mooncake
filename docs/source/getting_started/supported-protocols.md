@@ -310,7 +310,7 @@ export MC_INTRANODE_NVLINK=true
 
 ### Ascend Transport (ascend)
 
-**Description:** Huawei Ascend NPU communication using HCCL (Huawei Collective Communication Library) or direct transport.
+**Description:** Huawei Ascend NPU communication using HCCL (Huawei Collective Communication Library) or Ascend Direct (ADXL).
 
 **Use When:**
 - Working with Huawei Ascend NPUs
@@ -318,9 +318,12 @@ export MC_INTRANODE_NVLINK=true
 
 **Requirements:**
 - Huawei Ascend NPU hardware
-- HCCL runtime
+- Build with `-DUSE_ASCEND_DIRECT=ON` (recommended) or `-DUSE_ASCEND=ON` (HCCL)
+
+**Runtime selection (classic Transfer Engine):** compiling with `USE_ASCEND_DIRECT` is not enough to force the path forever. `MC_USE_ASCEND_DIRECT=1` (default in that build) auto-installs protocol `ascend` as Ascend Direct. `MC_USE_ASCEND_DIRECT=0` skips that auto-install so topology discovery can use RDMA/TCP. TENT uses JSON `transports/ascend_direct/enable` instead.
 
 **Documentation:**
+- [Ascend Direct Transport](../design/transfer-engine/ascend_direct_transport.md)
 - [Heterogeneous Ascend](../design/transfer-engine/heterogeneous_ascend.md)
 - [Ascend Transport](../design/transfer-engine/ascend_transport.md)
 

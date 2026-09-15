@@ -6,7 +6,7 @@ Ascend Direct Transport (referred to as Transport throughout this document) is l
 
 Transport is a transmission adapter layer built on CANN's ADXL capabilities, providing direct compatibility with the Mooncake Transfer Engine. With Transport, users can perform Host-to-Device, Device-to-Host, and Device-to-Device transfers in Ascend environments using various communication protocols such as HCCS and RDMA. Future enhancements will enable data transfer between heterogeneous Ascend and GPU environments.
 
-To build and use the Transport library, please follow the process described in `build.md` and enable the `USE_ASCEND_DIRECT` option.
+To build and use the Transport library, please follow the process described in `build.md` and enable the `USE_ASCEND_DIRECT` option. After that, a process can still turn the path off at runtime with `MC_USE_ASCEND_DIRECT=0` (see Environment Variables below). A binary built without `USE_ASCEND_DIRECT` cannot enable the path at runtime.
 
 ### Additional Dependencies
 
@@ -48,6 +48,7 @@ The following environment variables can be configured to control Ascend Direct T
 
 | Variable | Description | Default Value | Example |
 |----------|-------------|---------------|---------|
+| `MC_USE_ASCEND_DIRECT` | Runtime enable/disable for Ascend Direct on a binary built with `-DUSE_ASCEND_DIRECT=ON`. Classic (non-TENT) Transfer Engine only. `1`/`true` uses Ascend Direct (protocol `ascend`); `0`/`false` skips auto-install and lets topology discovery select RDMA/TCP (or HCCL if that backend was also compiled). Building without `USE_ASCEND_DIRECT` ignores `=1` and logs an error; it does not crash. TENT uses `transports/ascend_direct/enable` instead. | `1` when compiled with `USE_ASCEND_DIRECT`, otherwise `0` | `MC_USE_ASCEND_DIRECT=0` |
 | `ASCEND_AUTO_CONNECT` | Enable automatic connection management | 1 (enabled) | `ASCEND_AUTO_CONNECT=0` |
 | `ASCEND_ENABLE_USE_FABRIC_MEM` | Enable fabric memory transfer mode in Mooncake Store (A3 only) | 0 (disabled) | `ASCEND_ENABLE_USE_FABRIC_MEM=1` |
 | `ASCEND_USE_ASYNC_TRANSFER` | Enable asynchronous transfer mode | 0 (disabled) | `ASCEND_USE_ASYNC_TRANSFER=1` |
@@ -79,11 +80,11 @@ The following environment variables can be configured to control Ascend Direct T
 
 4. **Configuration File**: Ensure `/etc/hccn.conf` exists, especially in containers. Mount `/etc/hccn.conf` or copy the host file to the container's `/etc` path.
 
-5. **Timeout Configuration**: 
+5. **Timeout Configuration**:
    - Use the `ASCEND_CONNECT_TIMEOUT` environment variable to control link establishment timeout (default: 3 seconds)
    - Use the `ASCEND_TRANSFER_TIMEOUT` environment variable to control data transfer timeout (default: 3 seconds)
 
-6. **RDMA Timeout and Retry Configuration**: 
+6. **RDMA Timeout and Retry Configuration**:
    - Use `HCCL_RDMA_TIMEOUT` to configure the RDMA NIC packet retransmission timeout coefficient. The actual packet retransmission timeout is `4.096us * 2 ^ $HCCL_RDMA_TIMEOUT`
    - Use `HCCL_RDMA_RETRY_CNT` to configure the RDMA NIC retransmission count
    - It is recommended to configure `ASCEND_TRANSFER_TIMEOUT` to be slightly larger than `retransmission_timeout * HCCL_RDMA_RETRY_CNT`

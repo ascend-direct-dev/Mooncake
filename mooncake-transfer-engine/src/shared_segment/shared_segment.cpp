@@ -17,6 +17,7 @@
 #include <cstring>
 #include <glog/logging.h>
 
+#include "config.h"
 #include "shared_segment_internal.h"
 
 namespace mooncake {
@@ -42,11 +43,10 @@ std::string SelectSharedSegmentBackend(bool mmap) {
     if (mmap) {
         return "mmap";
     }
-#if defined(USE_ASCEND_DIRECT)
-    return "ascend";
-#else
+    if (isAscendDirectEnabled()) {
+        return "ascend";
+    }
     return {};
-#endif
 }
 
 uint64_t HashBytes(uint64_t seed, const void* data, size_t length) {
