@@ -640,6 +640,7 @@ The Transfer Engine respects the following environment variables:
 - `MC_TE_FILTERS`: Optional comma-separated whitelist of IB device names (e.g. `mlx5_0,mlx5_2`) for legacy Transfer Engine topology discovery. When unset, all available devices are discovered.
 - `MC_TE_METRIC`: Enables metrics reporting (set to "1", "true", "yes", or "on"). **Note:** Not supported when using Transfer Engine TENT.
 - `MC_TE_METRIC_INTERVAL_SECONDS`: Sets metrics reporting interval in seconds
+- `MC_USE_ASCEND_DIRECT`: Classic (non-TENT) Transfer Engine only. `1`/`true` uses Ascend Direct when the wheel/binary was built with `-DUSE_ASCEND_DIRECT=ON` (the default in that build). `0`/`false` skips Ascend Direct auto-install so topology discovery can select RDMA/TCP. Setting `1` on a build without `USE_ASCEND_DIRECT` is ignored and logged; it does not crash.
 
 ## Usage Examples
 

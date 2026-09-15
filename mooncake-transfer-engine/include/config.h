@@ -131,6 +131,15 @@ struct GlobalConfig {
     // Install RdmaTwoSidedTransport (CtrlChannel notify) instead of classic
     // one-sided RdmaTransport. MC_USE_RDMA_TWOSIDED.
     bool use_rdma_twosided = false;
+    // Classic (non-TENT) Transfer Engine: instantiate Ascend Direct when the
+    // protocol is "ascend". Requires a binary built with USE_ASCEND_DIRECT.
+    // Override via MC_USE_ASCEND_DIRECT. Default true when compiled in so
+    // existing Ascend Direct deployments keep their current behavior.
+#ifdef USE_ASCEND_DIRECT
+    bool use_ascend_direct = true;
+#else
+    bool use_ascend_direct = false;
+#endif
     // RDMA CtrlChannel notify path. MC_RDMA_NOTIFY_ENABLED.
     bool rdma_notify_enabled = true;
     // Ctrl recv/send slot count and slot size. MC_RDMA_NOTIFY_RECV_COUNT /
@@ -186,6 +195,11 @@ void dumpGlobalConfig();
 void updateGlobalConfig(ibv_device_attr& device_attr);
 
 GlobalConfig& globalConfig();
+
+// True when this process should use Ascend Direct: the binary was built with
+// USE_ASCEND_DIRECT and MC_USE_ASCEND_DIRECT has not disabled it. Always
+// false when the transport was not compiled in.
+bool isAscendDirectEnabled();
 
 uint16_t getDefaultHandshakePort();
 

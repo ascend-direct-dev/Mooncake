@@ -914,5 +914,59 @@ TEST_F(MtuEnvTest, InvalidIsIgnored) {
     EXPECT_EQ(config.mtu_length, IBV_MTU_4096);
 }
 
+// --- MC_USE_ASCEND_DIRECT (runtime switch; compile flag still required) ---
+
+class UseAscendDirectEnvTest : public ::testing::Test {
+   protected:
+    void TearDown() override { ::unsetenv("MC_USE_ASCEND_DIRECT"); }
+};
+
+TEST_F(UseAscendDirectEnvTest, DefaultMatchesCompileFlag) {
+    ::unsetenv("MC_USE_ASCEND_DIRECT");
+    GlobalConfig config;
+    loadGlobalConfig(config);
+#ifdef USE_ASCEND_DIRECT
+    EXPECT_TRUE(config.use_ascend_direct);
+#else
+    EXPECT_FALSE(config.use_ascend_direct);
+#endif
+}
+
+TEST_F(UseAscendDirectEnvTest, ZeroDisables) {
+    ASSERT_EQ(::setenv("MC_USE_ASCEND_DIRECT", "0", 1), 0);
+    GlobalConfig config;
+    config.use_ascend_direct = true;
+    loadGlobalConfig(config);
+    EXPECT_FALSE(config.use_ascend_direct);
+}
+
+TEST_F(UseAscendDirectEnvTest, FalseDisables) {
+    ASSERT_EQ(::setenv("MC_USE_ASCEND_DIRECT", "false", 1), 0);
+    GlobalConfig config;
+    config.use_ascend_direct = true;
+    loadGlobalConfig(config);
+    EXPECT_FALSE(config.use_ascend_direct);
+}
+
+TEST_F(UseAscendDirectEnvTest, OneEnablesOnlyWhenCompiled) {
+    ASSERT_EQ(::setenv("MC_USE_ASCEND_DIRECT", "1", 1), 0);
+    GlobalConfig config;
+    config.use_ascend_direct = false;
+    loadGlobalConfig(config);
+#ifdef USE_ASCEND_DIRECT
+    EXPECT_TRUE(config.use_ascend_direct);
+#else
+    EXPECT_FALSE(config.use_ascend_direct);
+#endif
+}
+
+TEST_F(UseAscendDirectEnvTest, InvalidKeepsDefault) {
+    ASSERT_EQ(::setenv("MC_USE_ASCEND_DIRECT", "maybe", 1), 0);
+    GlobalConfig config;
+    config.use_ascend_direct = true;  // sentinel preserved when env is rejected
+    loadGlobalConfig(config);
+    EXPECT_TRUE(config.use_ascend_direct);
+}
+
 }  // namespace
 }  // namespace mooncake

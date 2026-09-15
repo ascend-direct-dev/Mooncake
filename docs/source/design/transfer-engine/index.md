@@ -508,6 +508,7 @@ For advanced users, TransferEngine provides the following advanced runtime optio
 - `MC_MUSA_COPY_API` (`musa` transport only) Select `auto` (default), `transfer_batch`, or `default`. On MUSA SDK 5.2 or newer, `auto` uses `muMemoryTransferBatchAsync` when every copy in a batch meets `MC_MUSA_TRANSFER_BATCH_MIN_BYTES`; `default` uses per-slice CUDA-compatible copies.
 - `MC_MUSA_TRANSFER_BATCH_MIN_BYTES` (`musa` transport only) Minimum copy size selected by `MC_MUSA_COPY_API=auto`. The default is 1048576 (1 MiB).
 - `MC_FORCE_TCP` Force to use TCP as the active transport regardless whether RDMA devices are installed.
+- `MC_USE_ASCEND_DIRECT` Classic (non-TENT) Transfer Engine only. Enable (`1`/`true`) or disable (`0`/`false`) Ascend Direct when the binary was built with `-DUSE_ASCEND_DIRECT=ON`. Default is enabled in that build so existing deployments keep using Ascend Direct. Set `0` to skip auto-install of protocol `ascend` and fall back to topology discovery (RDMA/TCP, or HCCL if `-DUSE_ASCEND=ON` is also set). `=1` on a binary built without `USE_ASCEND_DIRECT` is ignored and logged; it does not crash. TENT keeps using `transports/ascend_direct/enable`.
 - `MC_MIN_RPC_PORT` Specifies the minimum port number for RPC service. The default value is 15000.
 - `MC_MAX_RPC_PORT` Specifies the maximum port number for RPC service. The default value is 17000.
 - `MC_PATH_ROUNDROBIN` Use round-robin mode in the RDMA path selection. This may be beneficial for transferring large bulks.
