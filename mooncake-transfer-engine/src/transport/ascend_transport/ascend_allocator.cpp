@@ -74,6 +74,7 @@ void remove_store_memory_range(void *ptr) {
 struct AllocRecord {
     aclrtDrvMemHandle handle;
     bool is_direct_alloc;
+    size_t size;
 };
 std::mutex g_vmm_alloc_mutex;
 std::unordered_map<void *, AllocRecord> g_vmm_alloc_records;
@@ -161,7 +162,7 @@ void *allocate_vmm_memory_direct_impl(size_t total_size, bool quiet = false) {
         return nullptr;
     }
     std::lock_guard<std::mutex> lock(g_vmm_alloc_mutex);
-    g_vmm_alloc_records.emplace(va, AllocRecord{handle, true});
+    g_vmm_alloc_records.emplace(va, AllocRecord{handle, true, total_size});
     return va;
 }
 
@@ -184,7 +185,7 @@ void *allocate_fabric_exact(size_t total_size, bool quiet = false) {
         LOG(INFO) << "Call adxl MallocMem suc, va:" << va
                   << ", size:" << total_size;
         std::lock_guard<std::mutex> lock(g_vmm_alloc_mutex);
-        g_vmm_alloc_records.emplace(va, AllocRecord{nullptr, false});
+        g_vmm_alloc_records.emplace(va, AllocRecord{nullptr, false, total_size});
         return va;
     }
     va = allocate_vmm_memory_direct_impl(total_size, quiet);
@@ -359,6 +360,29 @@ bool ascend_is_store_memory(void *addr, size_t length) {
             return true;
         }
     }
+    return false;
+}
+
+bool ascend_is_direct_vmm_memory(void *addr, size_t length) {
+    if (!addr || length == 0) return false;
+    auto addr_start = reinterpret_cast<uintptr_t>(addr);
+    uintptr_t addr_end = addr_start + length;
+#ifdef ASCEND_SUPPORT_FABRIC_MEM
+    std::lock_guard<std::mutex> lock(g_vmm_alloc_mutex);
+    for (const auto &[base, record] : g_vmm_alloc_records) {
+        if (!record.is_direct_alloc) {
+            continue;
+        }
+        auto base_start = reinterpret_cast<uintptr_t>(base);
+        uintptr_t base_end = base_start + record.size;
+        if (addr_start >= base_start && addr_end <= base_end) {
+            return true;
+        }
+    }
+#else
+    (void)addr_start;
+    (void)addr_end;
+#endif
     return false;
 }
 
