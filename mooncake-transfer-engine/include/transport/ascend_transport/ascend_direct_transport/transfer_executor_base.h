@@ -55,6 +55,9 @@ class TransferExecutorBase {
         int32_t connect_timeout = 10000;
         int32_t transfer_timeout = 10000;
         bool use_async_transfer = false;
+        // Same-process and imported-host copies stay on LocalCopyEngine unless
+        // ASCEND_USE_LOCAL_COPY=0 sends them through adxl.
+        bool use_local_copy = true;
         bool auto_connect = false;
         bool use_short_connection = false;
         bool use_buffer_pool = false;

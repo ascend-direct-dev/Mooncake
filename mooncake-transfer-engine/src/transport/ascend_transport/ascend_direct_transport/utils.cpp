@@ -15,6 +15,7 @@
 
 #include "transport/ascend_transport/ascend_direct_transport/utils.h"
 
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <pthread.h>
@@ -262,11 +263,22 @@ uint16_t FindAdxlListenPort(int32_t base_port, int32_t device_id) {
     std::uniform_int_distribution rand_dist;
     const int min_port = base_port + physical_dev_id * kPortRange;
     const int max_port = base_port + (physical_dev_id + 1) * kPortRange;
+    // A fixed store seed asks for the same listen port on every run. Walk the
+    // device's range from the bottom instead of drawing a random port.
+    const char* fixed_seed = std::getenv("MOONCAKE_RANDOM_SEED");
+    const bool stable_ports = fixed_seed != nullptr && fixed_seed[0] != '\0';
+    int sequential_port = min_port;
     LOG(INFO) << "Find available between " << min_port << " and " << max_port;
     bool use_ipv6 = globalConfig().use_ipv6;
     int sockfd;
     for (int attempt = 0; attempt < kMaxGenPortAttempts; ++attempt) {
-        int port = min_port + rand_dist(rand_gen) % (max_port - min_port + 1);
+        if (stable_ports && sequential_port > max_port) {
+            break;
+        }
+        int port = stable_ports
+                       ? sequential_port++
+                       : min_port + rand_dist(rand_gen) %
+                                         (max_port - min_port + 1);
         sockfd = socket(use_ipv6 ? AF_INET6 : AF_INET, SOCK_STREAM, 0);
         if (sockfd == -1) {
             continue;

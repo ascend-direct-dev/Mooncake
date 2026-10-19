@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <unordered_set>
+#include <vector>
 
 #include "local_ssd/manager.h"
 #include "placement/index.h"
@@ -79,7 +80,7 @@ std::unique_ptr<AllocatedBuffer> TryAllocateFromEntry(
         return (*entry->candidates.begin())->Allocate(size);
     }
 
-    size_t index = randomIndex(entry->candidates.size());
+    size_t index = allocationRandomIndex(entry->candidates.size());
     for (size_t i = 0; i < entry->candidates.size(); ++i) {
         if (auto buffer = (*entry->candidates.nth(index))->Allocate(size))
             [[likely]] {
@@ -220,13 +221,13 @@ void AllocatePreferredEntries(const ReplicaRequirements& requirements,
 
 template <typename Ranker>
 void AllocateRankedEntries(
-    std::span<const PlacementIndex::Entry* const> active_entries,
+    const std::vector<const PlacementIndex::Entry*>& active_entries,
     const ReplicaRequirements& requirements, const Ranker& ranker,
     PlacementScratch& scratch, std::vector<Replica>& result) {
     const size_t remaining = requirements.count - result.size();
     const size_t sample_count =
         std::min(active_entries.size(), kCandidateMultiplier * remaining);
-    const size_t start = randomIndex(active_entries.size());
+    const size_t start = allocationRandomIndex(active_entries.size());
     scratch.candidates.reserve(sample_count);
     for (size_t i = 0; i < sample_count; ++i) {
         const auto* entry = active_entries[(start + i) % active_entries.size()];
@@ -249,10 +250,10 @@ void AllocateRankedEntries(
 }
 
 void AllocateFallbackEntries(
-    std::span<const PlacementIndex::Entry* const> active_entries,
+    const std::vector<const PlacementIndex::Entry*>& active_entries,
     const ReplicaRequirements& requirements, PlacementScratch& scratch,
     std::vector<Replica>& result) {
-    size_t index_offset = randomIndex(active_entries.size());
+    size_t index_offset = allocationRandomIndex(active_entries.size());
     const size_t max_retry = std::min(kMaxRetryLimit, active_entries.size());
     for (size_t attempt = 0;
          attempt < max_retry && result.size() < requirements.count;
@@ -294,6 +295,18 @@ tl::expected<std::vector<Replica>, ErrorCode> AllocateWithRanker(
         return result;
     }
 
+    // Mount order is the active-entry order. A fixed seed sorts by name so
+    // the sampled window is the same set of segments on every run.
+    std::vector<const PlacementIndex::Entry*> sampling_entries(
+        active_entries.begin(), active_entries.end());
+    if (FixedRandomSeed()) {
+        std::sort(sampling_entries.begin(), sampling_entries.end(),
+                  [](const PlacementIndex::Entry* lhs,
+                     const PlacementIndex::Entry* rhs) {
+                      return lhs->segment_name < rhs->segment_name;
+                  });
+    }
+
     AllocatePreferredEntries(requirements, scratch, result);
     if (result.size() == requirements.count) {
         return result;
@@ -316,14 +329,14 @@ tl::expected<std::vector<Replica>, ErrorCode> AllocateWithRanker(
     }
 
     if constexpr (Ranker::kRanked) {
-        AllocateRankedEntries(active_entries, requirements, ranker, scratch,
+        AllocateRankedEntries(sampling_entries, requirements, ranker, scratch,
                               result);
         if (result.size() == requirements.count) {
             return result;
         }
     }
 
-    AllocateFallbackEntries(active_entries, requirements, scratch, result);
+    AllocateFallbackEntries(sampling_entries, requirements, scratch, result);
     if (result.empty()) {
         return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
     }

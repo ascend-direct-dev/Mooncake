@@ -4,6 +4,7 @@
 #include <future>
 #include <random>
 #include <thread>
+#include <vector>
 
 #include <gtest/gtest.h>
 
@@ -73,4 +74,29 @@ TEST(RandomTest, RejectsInvalidBounds) {
     std::mt19937_64 engine(42);
     EXPECT_THROW(randomIndex(0, engine), std::invalid_argument);
     EXPECT_THROW(randomUniform(2, 1, engine), std::invalid_argument);
+}
+
+TEST(RandomTest, FixedSeedRepeatsAllocationStream) {
+    struct ClearOnExit {
+        ~ClearOnExit() { ClearRandomSeed(); }
+    } clear_on_exit;
+
+    auto draw = [] {
+        std::vector<size_t> values;
+        values.reserve(16);
+        for (int i = 0; i < 16; ++i) {
+            values.push_back(allocationRandomIndex(16));
+        }
+        return values;
+    };
+
+    SetRandomSeed(7);
+    const auto first = draw();
+    SetRandomSeed(7);
+    const auto second = draw();
+    EXPECT_EQ(first, second);
+
+    SetRandomSeed(8);
+    const auto other = draw();
+    EXPECT_NE(first, other);
 }

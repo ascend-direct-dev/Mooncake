@@ -282,6 +282,14 @@ class AllocationStrategy {
         const std::string& segment_name) = 0;
 };
 
+// A fixed seed repeats placement only when the candidate list is in the same
+// order. Sort serving names so mount arrival order does not change the walk.
+inline void CanonicalizeServingNames(std::vector<std::string>& names) {
+    if (FixedRandomSeed().has_value()) {
+        std::sort(names.begin(), names.end());
+    }
+}
+
 /**
  * @brief Random batch allocation strategy with local preference and
  *        replication guarantees support using best-effort semantics.
@@ -314,7 +322,8 @@ class RandomAllocationStrategy : public AllocationStrategy {
         }
 
         // Check available segments.
-        const auto names = allocator_manager.getServingNames();
+        auto names = allocator_manager.getServingNames();
+        CanonicalizeServingNames(names);
         if (names.empty()) {
             return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
         }
@@ -364,7 +373,7 @@ class RandomAllocationStrategy : public AllocationStrategy {
 
         // If replica_num is not satisfied, allocate the remaining replicas
         // randomly.
-        size_t start_idx = randomIndex(names.size());
+        size_t start_idx = allocationRandomIndex(names.size());
 
         const size_t max_retry = std::min(kMaxRetryLimit, names.size());
         size_t try_count = 0;
@@ -437,7 +446,7 @@ class RandomAllocationStrategy : public AllocationStrategy {
         // Randomly select a start point to distribute
         // allocations across all segments
         // Select a start segment to place the replica.
-        size_t seg_offset = randomIndex(num_segs);
+        size_t seg_offset = allocationRandomIndex(num_segs);
         for (size_t i = 0; i < num_segs; i++) {  // only allocate one replica
             const auto& registration =
                 (*allocators)[(i + seg_offset) % num_segs];
@@ -471,7 +480,8 @@ class RankedAllocationStrategy : public RandomAllocationStrategy {
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
 
-        const auto names = allocator_manager.getServingNames();
+        auto names = allocator_manager.getServingNames();
+        CanonicalizeServingNames(names);
         if (names.empty()) {
             return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
         }
@@ -500,7 +510,7 @@ class RankedAllocationStrategy : public RandomAllocationStrategy {
         const size_t remaining = replica_num - replicas.size();
         const size_t sample_count =
             std::min(kCandidateMultiplier * remaining, names.size());
-        const size_t start_idx = randomIndex(names.size());
+        const size_t start_idx = allocationRandomIndex(names.size());
 
         struct Candidate {
             size_t name_idx;
@@ -539,7 +549,7 @@ class RankedAllocationStrategy : public RandomAllocationStrategy {
             return replicas;
         }
 
-        size_t fallback_idx = randomIndex(names.size());
+        size_t fallback_idx = allocationRandomIndex(names.size());
         const size_t max_retry = std::min(kMaxRetryLimit, names.size());
         size_t try_count = 0;
         while (replicas.size() < replica_num && try_count < max_retry) {

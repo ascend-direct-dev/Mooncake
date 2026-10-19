@@ -1022,4 +1022,60 @@ TEST_F(AllocationStrategyTest, SsdFreeRatioFirstVsRandomStrategyPerformance) {
         << "% slower)\n\n";
 }
 
+std::vector<std::string> AllocateWithFixedSeed(
+    const std::shared_ptr<AllocationStrategy>& strategy,
+    const std::vector<std::string>& insert_order) {
+    SetRandomSeed(1);
+    struct ClearOnExit {
+        ~ClearOnExit() { ClearRandomSeed(); }
+    } clear_on_exit;
+
+    AllocatorManager manager;
+    size_t offset = 0;
+    for (const auto& name : insert_order) {
+        const size_t base = 0x100000000ULL + offset;
+        offset += 0x10000000ULL;
+        auto allocator = CreateBufferAllocator(BufferAllocatorType::OFFSET, name,
+                                               base, 64 * MiB, name);
+        EXPECT_TRUE(allocator.has_value()) << name;
+        if (!allocator.has_value()) {
+            return {};
+        }
+        manager.addAllocator(name, std::move(allocator.value()));
+    }
+
+    std::vector<std::string> chosen;
+    chosen.reserve(8);
+    for (int i = 0; i < 8; ++i) {
+        auto result = strategy->Allocate(manager, 1024, 1, {}, {});
+        EXPECT_TRUE(result.has_value());
+        if (!result.has_value() || result->empty()) {
+            return chosen;
+        }
+        auto descriptor = result->front().get_descriptor();
+        EXPECT_TRUE(descriptor.is_memory_replica());
+        if (!descriptor.is_memory_replica()) {
+            return chosen;
+        }
+        chosen.push_back(descriptor.get_memory_descriptor()
+                             .buffer_descriptor.transport_endpoint_);
+    }
+    return chosen;
+}
+
+TEST(AllocationStrategyDeterministicTest, FixedSeedIgnoresMountOrder) {
+    const std::vector<std::string> forward = {"seg-c", "seg-a", "seg-b"};
+    const std::vector<std::string> reverse = {"seg-b", "seg-c", "seg-a"};
+    for (const auto type : {AllocationStrategyType::RANDOM,
+                            AllocationStrategyType::FREE_RATIO_FIRST}) {
+        LocalSsdManager local_ssd;
+        const auto first = AllocateWithFixedSeed(
+            CreateAllocationStrategy(type, local_ssd), forward);
+        const auto second = AllocateWithFixedSeed(
+            CreateAllocationStrategy(type, local_ssd), reverse);
+        ASSERT_EQ(first.size(), 8u);
+        EXPECT_EQ(first, second);
+    }
+}
+
 }  // namespace mooncake

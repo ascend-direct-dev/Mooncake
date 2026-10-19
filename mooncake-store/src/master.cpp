@@ -32,6 +32,7 @@
 #include "glog_compat.h"
 
 #include "master_config.h"
+#include "random.h"
 #include "version.h"
 
 using namespace coro_rpc;
@@ -387,6 +388,12 @@ DEFINE_string(
     allocation_strategy, "random",
     "Allocation strategy for segments, random | free_ratio_first | cxl | "
     "ssd_free_ratio_first | local_first");
+DEFINE_int64(
+    random_seed, -1,
+    "Fixed seed for segment allocation. Negative keeps a nondeterministic "
+    "per-thread seed. When set, serving segment names are sorted before "
+    "sampling so placement does not follow mount order. "
+    "MOONCAKE_RANDOM_SEED is used when this flag is negative.");
 DEFINE_bool(enable_http_metadata_server, false,
             "Enable HTTP metadata server instead of etcd");
 DEFINE_int32(http_metadata_server_port, 8080,
@@ -1381,6 +1388,12 @@ int main(int argc, char* argv[]) {
     // Initialize gflags
     gflags::SetVersionString(mooncake::MOONCAKE_DISPLAY_VERSION);
     gflags::ParseCommandLineFlags(&argc, &argv, true);
+    // Latch the seed before any allocation. Logging waits until glog is up.
+    if (FLAGS_random_seed >= 0) {
+        mooncake::SetRandomSeed(static_cast<uint64_t>(FLAGS_random_seed));
+    } else {
+        (void)mooncake::FixedRandomSeed();
+    }
 
     if (!FLAGS_log_dir.empty()) {
         // MC_LOG_DIR may have initialized glog (and set FLAGS_log_dir) from
@@ -1402,6 +1415,16 @@ int main(int argc, char* argv[]) {
 
     LOG(INFO) << "Mooncake master version: "
               << mooncake::MOONCAKE_DISPLAY_VERSION;
+    if (mooncake::ConsumeRejectedRandomSeedEnv()) {
+        const char* env = std::getenv("MOONCAKE_RANDOM_SEED");
+        LOG(WARNING) << "Ignoring MOONCAKE_RANDOM_SEED='"
+                     << (env == nullptr ? "" : env)
+                     << "'; expected an unsigned integer";
+    }
+    if (const auto seed = mooncake::FixedRandomSeed()) {
+        LOG(INFO) << "Fixed segment allocation RNG seed=" << *seed
+                  << ". Serving segment names are sorted before sampling.";
+    }
 
     // Initialize the master configuration
     mooncake::MasterConfig master_config;

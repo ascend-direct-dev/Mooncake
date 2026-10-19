@@ -708,6 +708,7 @@ class AscendDirectTransportTest : public ::testing::Test {
 
     void TearDown() override {
         unsetenv("ASCEND_AUTO_CONNECT");
+        unsetenv("ASCEND_USE_LOCAL_COPY");
         ContextManager::getInstance().finalize();
         google::ShutdownGoogleLogging();
     }
@@ -907,6 +908,26 @@ class AscendDirectTransportTest : public ::testing::Test {
 // -----------------------------------------------------------------------------
 // Basic API tests
 // -----------------------------------------------------------------------------
+
+TEST_F(AscendDirectTransportTest, LocalCopySwitch_FollowsEnv) {
+    auto expect_switch = [](const char* value, bool enabled) {
+        if (value == nullptr) {
+            unsetenv("ASCEND_USE_LOCAL_COPY");
+        } else {
+            setenv("ASCEND_USE_LOCAL_COPY", value, 1);
+        }
+        TransferExecutorBase::InitParams params;
+        TransferExecutorBase::ParseExecutorEnvIntoInitParams(params);
+        EXPECT_EQ(params.use_local_copy, enabled) << "value="
+                                                  << (value ? value : "<unset>");
+    };
+    expect_switch(nullptr, true);
+    expect_switch("1", true);
+    expect_switch("0", false);
+    expect_switch("2", true);
+    expect_switch("no", true);
+    unsetenv("ASCEND_USE_LOCAL_COPY");
+}
 
 TEST_F(AscendDirectTransportTest, Basic_ConstructorAndName) {
     auto transport = std::make_unique<AscendDirectTransport>();

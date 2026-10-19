@@ -183,6 +183,20 @@ void TransferExecutorBase::ParseExecutorEnvIntoInitParams(InitParams& params) {
     if (use_async) {
         params.use_async_transfer = true;
     }
+    char* use_local_copy = std::getenv("ASCEND_USE_LOCAL_COPY");
+    if (use_local_copy) {
+        auto use_local_copy_opt = parseFromString<int32_t>(use_local_copy);
+        if (!use_local_copy_opt.has_value() ||
+            (*use_local_copy_opt != 0 && *use_local_copy_opt != 1)) {
+            LOG(WARNING) << "ASCEND_USE_LOCAL_COPY is not valid, value:"
+                         << use_local_copy << ", defaulting to enabled";
+            params.use_local_copy = true;
+        } else {
+            params.use_local_copy = (*use_local_copy_opt == 1);
+            LOG(INFO) << "Set use_local_copy from ASCEND_USE_LOCAL_COPY to: "
+                      << *use_local_copy_opt;
+        }
+    }
     char* auto_connect = std::getenv("ASCEND_AUTO_CONNECT");
     if (auto_connect) {
         auto auto_connect_opt = parseFromString<int32_t>(auto_connect);
@@ -212,20 +226,23 @@ int TransferExecutorBase::initEngines() {
         LOG(ERROR) << "Buffer pool mode does not support async transfer.";
         return -1;
     }
-    local_copy_engine_ = std::make_unique<LocalCopyEngine>();
-    if (!local_copy_engine_) {
-        return ERR_MEMORY;
-    }
-    int ret = local_copy_engine_->Initialize(params_.transfer_timeout);
-    if (ret != 0) {
-        LOG(ERROR) << "Failed to initialize LocalCopyEngine, ret: " << ret;
-        return ret;
-    }
-    // Whether a destination can be copied locally is decided per buffer, from
-    // the memfd handle in shm_name. Install the mapper for every non-fabric
-    // engine so that check can run; a buffer without a handle stays on adxl.
-    if (!params_.use_fabric_mem) {
-        shared_host_mapper_ = std::make_unique<SharedHostMapper>();
+    if (params_.use_local_copy) {
+        local_copy_engine_ = std::make_unique<LocalCopyEngine>();
+        if (!local_copy_engine_) {
+            return ERR_MEMORY;
+        }
+        int ret = local_copy_engine_->Initialize(params_.transfer_timeout);
+        if (ret != 0) {
+            LOG(ERROR) << "Failed to initialize LocalCopyEngine, ret: " << ret;
+            return ret;
+        }
+        // Whether a destination can be copied locally is decided per buffer,
+        // from the memfd handle in shm_name. Install the mapper for every
+        // non-fabric engine so that check can run; a buffer without a handle
+        // stays on adxl.
+        if (!params_.use_fabric_mem) {
+            shared_host_mapper_ = std::make_unique<SharedHostMapper>();
+        }
     }
     aclrtContext saved_ctx = nullptr;
     if (aclrtGetCurrentContext(&saved_ctx) != ACL_ERROR_NONE) {
@@ -759,13 +776,16 @@ void TransferExecutorBase::processHomogeneousSliceList(
         // ours. Otherwise the target may still be a peer process here that
         // shared its host segment, in which case the mapper gives us local
         // addresses for the same physical pages. Either way we memcpy instead
-        // of going out through adxl.
+        // of going out through adxl. ASCEND_USE_LOCAL_COPY=0 skips this and
+        // uses adxl for the same slices.
         std::vector<void*> local_dest_addrs;
-        bool need_local_copy =
-            !params_.use_fabric_mem &&
-            (target_adxl_engine_name == local_engine_name ||
-             resolveLocalCopyDestinations(target_segment_desc, slice_list,
-                                          local_dest_addrs));
+        bool need_local_copy = false;
+        if (params_.use_local_copy && !params_.use_fabric_mem) {
+            need_local_copy =
+                target_adxl_engine_name == local_engine_name ||
+                resolveLocalCopyDestinations(target_segment_desc, slice_list,
+                                             local_dest_addrs);
+        }
         if (need_local_copy && local_copy_engine_) {
             auto start = std::chrono::steady_clock::now();
             local_copy_engine_->Copy(slice_list[0]->opcode, slice_list,

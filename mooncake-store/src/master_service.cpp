@@ -3089,7 +3089,7 @@ std::vector<tl::expected<bool, ErrorCode>> MasterService::BatchExistKeyImpl(
         indices_by_shard[shard_idx].push_back(i);
     }
 
-    const size_t start_shard = randomIndex(kNumShards);
+    const size_t start_shard = stableIndex(kNumShards, 0);
     for (size_t scanned = 0; scanned < kNumShards; ++scanned) {
         const size_t shard_idx =
             (start_shard + kNumShards - scanned) % kNumShards;
@@ -4924,7 +4924,7 @@ MasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
         key_list_heads[shard_idx] = original_idx;
     }
 
-    const size_t start_shard = randomIndex(kNumShards);
+    const size_t start_shard = stableIndex(kNumShards, 0);
     for (size_t scanned = 0; scanned < kNumShards; ++scanned) {
         const size_t shard_idx =
             (start_shard + kNumShards - scanned) % kNumShards;
@@ -5083,7 +5083,7 @@ MasterService::BatchGetReplicaListForAdmin(const std::vector<std::string>& keys,
         key_list_heads[shard_idx] = original_idx;
     }
 
-    const size_t start_shard = randomIndex(kNumShards);
+    const size_t start_shard = stableIndex(kNumShards, 0);
     for (size_t scanned = 0; scanned < kNumShards; ++scanned) {
         const size_t shard_idx =
             (start_shard + kNumShards - scanned) % kNumShards;
@@ -10978,7 +10978,7 @@ MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
     };
 
     auto pass = [&](bool allow_soft_pinned) {
-        const size_t start_shard = randomIndex(kNumShards);
+        const size_t start_shard = stableIndex(kNumShards, 0);
         for (size_t scanned = 0;
              scanned < kNumShards && total.freed_bytes < target_bytes;
              ++scanned) {
@@ -11413,7 +11413,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
 
     // Randomly select a starting shard to avoid imbalance eviction between
     // shards.
-    size_t start_idx = randomIndex(kNumShards);
+    size_t start_idx = stableIndex(kNumShards, 0);
     std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
 
     // ===== Phase 1: Parallel candidate census =====
@@ -11960,7 +11960,7 @@ void MasterService::NoFBatchEvict(double evict_ratio_target,
                replica.get_refcnt() == 0;
     };
 
-    size_t start_idx = randomIndex(metadata_shards_.size());
+    size_t start_idx = stableIndex(metadata_shards_.size(), 0);
     for (size_t i = 0; i < metadata_shards_.size(); i++) {
         MetadataShardAccessorRW shard(
             this, (start_idx + i) % metadata_shards_.size());
@@ -12595,7 +12595,7 @@ tl::expected<UUID, ErrorCode> MasterService::CreateCopyTask(
     }
 
     const auto& [selected_source_segment, select_client, liveness] =
-        serving_sources[randomIndex(serving_sources.size())];
+        serving_sources[stableIndex(serving_sources.size(), 0)];
     auto serving_guard = liveness->TryAcquireServingGuard();
     if (!serving_guard) {
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
