@@ -266,7 +266,7 @@ tl::expected<std::vector<Slice>, ErrorCode> StageWriteSlices(
 
 using BatchWriteMethod = std::vector<tl::expected<void, ErrorCode>> (Client::*)(
     const std::vector<ObjectKey> &, std::vector<std::vector<Slice>> &,
-    const ReplicateConfig &, const Client::WriteBufferStager &);
+    const ReplicateConfig &, const Client::WriteBufferStager &, bool);
 
 std::vector<tl::expected<void, ErrorCode>> BatchWriteFromMultiBuffers(
     const std::shared_ptr<Client> &client, const std::vector<std::string> &keys,
@@ -295,7 +295,8 @@ std::vector<tl::expected<void, ErrorCode>> BatchWriteFromMultiBuffers(
             return StageWriteSlices(allocator, slices, staging_handles);
         };
     }
-    return ((*client).*write)(keys, batched_slices.value(), config, stager);
+    return ((*client).*write)(keys, batched_slices.value(), config, stager,
+                              /*group_by_target=*/true);
 }
 
 #ifdef USE_ASCEND_DIRECT
@@ -8136,7 +8137,8 @@ RealClient::batch_get_into_multi_buffers_internal(
 
         auto batch_get_results =
             client_->BatchGet(batch_keys, batch_query_results, batch_slices,
-                              prefer_alloc_in_same_node);
+                              prefer_alloc_in_same_node,
+                              /*group_by_target=*/true);
 
         for (size_t j = 0; j < batch_get_results.size(); ++j) {
             const auto &op = valid_operations[dedup.primaries[j]];
