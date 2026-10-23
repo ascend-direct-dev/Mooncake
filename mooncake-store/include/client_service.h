@@ -924,6 +924,13 @@ class Client {
     ErrorCode ReadDfsReplica(const std::string& key,
                              const Replica::Descriptor& replica_descriptor,
                              std::vector<Slice>& slices);
+    // Reads one byte window of each DISK or DFS replica. `windows[i]` receives
+    // `windows[i].size` bytes starting at `value_offsets[i]` in the value.
+    std::vector<tl::expected<void, ErrorCode>> BatchReadFileReplicaRanges(
+        const std::vector<std::string>& keys,
+        const std::vector<Replica::Descriptor>& replicas,
+        const std::vector<Slice>& windows,
+        const std::vector<uint64_t>& value_offsets);
     tl::expected<uint64_t, ErrorCode> ComputeObjectChecksumForSlices(
         const std::string& object_key, const std::vector<Slice>& slices,
         size_t object_size);
