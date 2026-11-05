@@ -2903,7 +2903,7 @@ impl StoreClient {
         let copy_elapsed = copy_started.elapsed();
         let transfer_started = std::time::Instant::now();
         if !remote_requests.is_empty() {
-            const DIRECT_READ_BATCH_REQUESTS: usize = 2048;
+            const DIRECT_READ_BATCH_REQUESTS: usize = 16384;
             let request_deadline = self.request_deadline_for_transfer(bytes_out, 1);
             let hints = self.remote_batch_hints(
                 &tenant,
