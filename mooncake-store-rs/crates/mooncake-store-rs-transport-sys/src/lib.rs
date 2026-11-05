@@ -687,6 +687,7 @@ pub mod tent {
         _shim: DynamicLibrary,
         load_config_from_file: unsafe extern "C" fn(*const c_char),
         set_config: unsafe extern "C" fn(*const c_char, *const c_char),
+        prepare_ascend: unsafe extern "C" fn(c_int) -> c_int,
         create_engine: unsafe extern "C" fn() -> TentEngineHandle,
         destroy_engine: unsafe extern "C" fn(TentEngineHandle),
         segment_name: unsafe extern "C" fn(TentEngineHandle, *mut c_char, usize) -> c_int,
@@ -727,6 +728,7 @@ pub mod tent {
         Some(TentApi {
             load_config_from_file: load_symbol(tent_shared, "tent_load_config_from_file")?,
             set_config: load_symbol(tent_shared, "tent_set_config")?,
+            prepare_ascend: load_symbol(shim, "mooncake_tent_prepare_ascend")?,
             create_engine: load_symbol(tent_shared, "tent_create_engine")?,
             destroy_engine: load_symbol(tent_shared, "tent_destroy_engine")?,
             segment_name: load_symbol(tent_shared, "tent_segment_name")?,
@@ -761,6 +763,12 @@ pub mod tent {
         if let Some(api) = api() {
             (api.set_config)(key, value);
         }
+    }
+
+    /// Bind ACL (aclInit once + aclrtSetDevice) on the calling thread before
+    /// creating a TENT engine whose ascend_direct transport is enabled.
+    pub unsafe extern "C" fn tentPrepareAscend(device_id: c_int) -> c_int {
+        api().map_or(-1, |api| (api.prepare_ascend)(device_id))
     }
 
     pub unsafe extern "C" fn tent_create_engine() -> TentEngineHandle {
