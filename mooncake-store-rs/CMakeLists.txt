@@ -68,6 +68,16 @@ if(USE_ASCEND_DIRECT OR USE_ASCEND OR USE_ASCEND_HETEROGENEOUS)
   target_include_directories(
     mooncake_store_rs_tent_shim PRIVATE ${STORE_RS_ASCEND_TOOLKIT_ROOT}/include)
 endif()
+# The TENT ascent shim also uses the shared ascend host allocator when
+# ASCEND_USE_SHMEM is enabled: memfd-backed host segments can be imported by
+# same-host peers, which turns their transfers into local copies (same model as
+# the C++ Store TENT path).
+if(TARGET ascend_allocator)
+  target_link_libraries(mooncake_store_rs_tent_shim PRIVATE ascend_allocator)
+  target_include_directories(
+    mooncake_store_rs_tent_shim PRIVATE
+    ${PROJECT_SOURCE_DIR}/mooncake-transfer-engine/include)
+endif()
 target_link_libraries(mooncake_store_rs_tent_shim PRIVATE tent_shared)
 set_target_properties(
   mooncake_store_rs_tent_shim

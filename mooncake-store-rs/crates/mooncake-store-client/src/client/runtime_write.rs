@@ -1013,11 +1013,40 @@ impl StoreClient {
                                     .map(|memory| memory.has_storage_segment(&target.segment_name))
                                     .unwrap_or(false);
                             let offset = if is_local {
-                                let value = if let Some(value) = entry.value {
+                                // NPU device sources cannot be hashed/copied on
+                                // the CPU; stage them into host memory once.
+                                let staged_source: Option<Vec<u8>> =
+                                    if entry.value.is_none() {
+                                        match entry.registered_source {
+                                            Some(source)
+                                                if mooncake_store_rs_transport::ascend_pointer_is_device(
+                                                    source,
+                                                ) == Some(true) =>
+                                            {
+                                                let mut host = vec![0u8; entry.value_len];
+                                                mooncake_store_rs_transport::ascend_copy_d2h(
+                                                    host.as_mut_ptr().cast::<c_void>(),
+                                                    source.cast::<c_void>(),
+                                                    entry.value_len,
+                                                )
+                                                .map_err(StoreError::Transport)?;
+                                                Some(host)
+                                            }
+                                            _ => None,
+                                        }
+                                    } else {
+                                        None
+                                    };
+                                let value: &[u8] = if let Some(value) = entry.value {
                                     value
+                                } else if let Some(host) = staged_source.as_deref() {
+                                    host
                                 } else if let Some(source) = entry.registered_source {
                                     unsafe {
-                                        slice::from_raw_parts(source.cast::<u8>(), entry.value_len)
+                                        slice::from_raw_parts(
+                                            source.cast::<u8>(),
+                                            entry.value_len,
+                                        )
                                     }
                                 } else {
                                     return Err(StoreError::InvalidState(format!(
