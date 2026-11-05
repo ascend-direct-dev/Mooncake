@@ -3,8 +3,11 @@
 
 #include <acl/acl.h>
 
+#include "ascend_allocator.h"
+
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <limits>
 #include <mutex>
 
@@ -87,4 +90,66 @@ extern "C" int mooncake_tent_prepare_ascend(int device_id) {
         return -1;
     }
     return 0;
+}
+
+// Ascend host allocator (memfd-backed when ASCEND_USE_SHMEM=1). A peer on the
+// same host can import the memfd and serve transfers as local copies, matching
+// the C++ Store TENT path. Falls back to nullptr and lets the caller allocate.
+extern "C" void* mooncake_tent_ascend_host_alloc(size_t size) {
+    return mooncake::ascend_allocate_memory(size, "");
+}
+
+extern "C" void mooncake_tent_ascend_host_free(void* ptr) {
+    if (ptr != nullptr) {
+        mooncake::ascend_free_memory("", ptr);
+    }
+}
+
+// --- ACL device-memory helpers for Store-RS ---------------------------------
+// Store-RS runs its CPU copies in the client dispatcher: when a put_from source
+// or a get_into destination is NPU device memory, the payload has to be staged
+// through host memory with a device copy. Device id comes from
+// MC_STORE_RS_ASCEND_DEVICE.
+namespace {
+int BindAscendDeviceFromEnv() {
+    const char* env = std::getenv("MC_STORE_RS_ASCEND_DEVICE");
+    int device_id = 0;
+    if (env != nullptr && env[0] != '\0') {
+        device_id = std::atoi(env);
+    }
+    return aclrtSetDevice(device_id) == ACL_ERROR_NONE ? 0 : -1;
+}
+}  // namespace
+
+extern "C" int mooncake_tent_acl_pointer_is_device(void* addr) {
+    if (addr == nullptr) {
+        return -1;
+    }
+    aclrtPtrAttributes attributes{};
+    if (aclrtPointerGetAttributes(addr, &attributes) != ACL_ERROR_NONE) {
+        return -1;
+    }
+    return attributes.location.type == ACL_MEM_LOCATION_TYPE_DEVICE ? 1 : 0;
+}
+
+extern "C" int mooncake_tent_acl_memcpy_d2h(void* dst, const void* src,
+                                            size_t len) {
+    if (BindAscendDeviceFromEnv() != 0) {
+        return -1;
+    }
+    return aclrtMemcpy(dst, len, src, len, ACL_MEMCPY_DEVICE_TO_HOST) ==
+                   ACL_ERROR_NONE
+               ? 0
+               : -1;
+}
+
+extern "C" int mooncake_tent_acl_memcpy_h2d(void* dst, const void* src,
+                                            size_t len) {
+    if (BindAscendDeviceFromEnv() != 0) {
+        return -1;
+    }
+    return aclrtMemcpy(dst, len, src, len, ACL_MEMCPY_HOST_TO_DEVICE) ==
+                   ACL_ERROR_NONE
+               ? 0
+               : -1;
 }

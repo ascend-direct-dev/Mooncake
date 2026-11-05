@@ -209,9 +209,13 @@ unsafe impl Sync for TentEngine {}
 enum TentAllocationOwner {
     /// Allocated by TENT (tent_allocate_memory) and freed through TENT.
     Tent,
-    /// Allocated by Store-RS on the host (ascend mode: TENT has no host
-    /// allocator for ascend_direct); freed with std::alloc::dealloc.
+    /// Allocated by Store-RS on the host (ascend mode fallback when the
+    /// Ascend store allocator is unavailable); freed with std::alloc::dealloc.
     Host,
+    /// Allocated by the Ascend store allocator (ascend_allocate_memory). When
+    /// ASCEND_USE_SHMEM=1 the mapping is memfd-backed and same-host peers can
+    /// import it, which makes their transfers local copies.
+    AscendHost,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -387,8 +391,16 @@ impl TentEngine {
             // FABRIC/TCP allocators (transfer_engine_impl.cpp:813-869); with
             // only ascend_direct installed it fails with
             // "Not supported type in memory options". Mirror the C++ Store:
-            // allocate host memory ourselves (2 MiB aligned for ADXL host
-            // registration) and let TENT register it.
+            // use the Ascend store allocator (ascend_allocate_memory), which
+            // returns either aclrtMallocHost memory or, with
+            // ASCEND_USE_SHMEM=1, a memfd mapping that same-host peers import
+            // so their transfers become local copies. Fall back to our own
+            // 2 MiB-aligned host allocation if the allocator is unavailable.
+            let addr = unsafe { ffi::tentAscendHostAlloc(size) };
+            if !addr.is_null() {
+                self.mark_owned_allocation(addr, size, TentAllocationOwner::AscendHost)?;
+                return Ok(addr);
+            }
             let addr = allocate_host_aligned(size)?;
             self.mark_owned_allocation(addr, size, TentAllocationOwner::Host)?;
             return Ok(addr);
@@ -413,6 +425,10 @@ impl TentEngine {
             let rc = unsafe { ffi::tent_free_memory(self.engine_handle()?, addr) };
             return check_zero(rc, "tent_free_memory");
         };
+        if allocation.owner == TentAllocationOwner::AscendHost {
+            unsafe { ffi::tentAscendHostFree(addr) };
+            return Ok(());
+        }
         if allocation.owner == TentAllocationOwner::Host {
             let layout = host_allocation_layout(allocation.size)?;
             // SAFETY: allocated by allocate_host_aligned with this layout.
