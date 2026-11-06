@@ -2935,30 +2935,73 @@ impl StoreClient {
         let copy_elapsed = copy_started.elapsed();
         let transfer_started = std::time::Instant::now();
         if !remote_requests.is_empty() {
-            const DIRECT_READ_BATCH_REQUESTS: usize = 16384;
+            // C++ Store groups reads by target endpoint and submits one batch
+            // per endpoint asynchronously (TransferSubmitter::submit_batch),
+            // then waits for all of them. A single global batch serializes the
+            // per-owner transfer slots and caps throughput at ~one stream.
+            let mut requests_by_target: BTreeMap<u64, Vec<TransferRequest>> = BTreeMap::new();
+            let request_count = remote_requests.len();
+            for request in remote_requests {
+                requests_by_target
+                    .entry(request.target_id)
+                    .or_default()
+                    .push(request);
+            }
             let request_deadline = self.request_deadline_for_transfer(bytes_out, 1);
             let hints = self.remote_batch_hints(
                 &tenant,
                 bytes_out,
                 TransferPacingMode::ThroughputOptimized,
             );
-            for chunk in remote_requests.chunks(DIRECT_READ_BATCH_REQUESTS) {
-                let batch_id = transport.allocate_batch(chunk.len())?;
-                if let Err(error) = transport.submit_with_hints(batch_id, chunk, &hints) {
+            let mut batches: Vec<u64> = Vec::with_capacity(requests_by_target.len());
+            let mut submit_error: Option<StoreError> = None;
+            let submit_started = std::time::Instant::now();
+            for requests in requests_by_target.values() {
+                let batch_id = match transport.allocate_batch(requests.len()) {
+                    Ok(batch_id) => batch_id,
+                    Err(error) => {
+                        submit_error = Some(error);
+                        break;
+                    }
+                };
+                if let Err(error) = transport.submit_with_hints(batch_id, requests, &hints) {
                     let _ = transport.free_batch(batch_id);
-                    return Err(error);
+                    submit_error = Some(error);
+                    break;
                 }
+                batches.push(batch_id);
+            }
+            let submit_elapsed = submit_started.elapsed();
+            let wait_started = std::time::Instant::now();
+            let mut wait_error: Option<StoreError> = submit_error;
+            for batch_id in &batches {
                 let wait_result = wait_for_batch_completion_detailed(
                     transport,
-                    batch_id,
+                    *batch_id,
                     self.transfer_stall_timeout,
                     request_deadline.instant(),
                 );
-                let free_result = transport.free_batch(batch_id);
-                if let Err(error) = wait_result {
-                    return Err(StoreError::from(error.clone()));
+                let free_result = transport.free_batch(*batch_id);
+                if wait_error.is_none() {
+                    if let Err(error) = wait_result {
+                        wait_error = Some(StoreError::from(error.clone()));
+                    } else if let Err(error) = free_result {
+                        wait_error = Some(error);
+                    }
                 }
-                free_result?;
+            }
+            if let Some(error) = wait_error {
+                return Err(error);
+            }
+            if std::env::var_os("MC_STORE_RS_TIMING").is_some() {
+                eprintln!(
+                    "[mc-rs-direct] items={} bytes={} targets={} submit_ms={:.2} wait_ms={:.2}",
+                    request_count,
+                    bytes_out,
+                    batches.len(),
+                    submit_elapsed.as_secs_f64() * 1e3,
+                    wait_started.elapsed().as_secs_f64() * 1e3,
+                );
             }
             registry::record_transport_operation("read", "storage", "ok");
             registry::record_transport_bytes("read", "storage", bytes_out);

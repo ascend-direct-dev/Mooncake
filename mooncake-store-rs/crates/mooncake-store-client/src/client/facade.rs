@@ -1344,7 +1344,9 @@ impl MooncakeCompatibilityFacade for StoreClient {
             .attribute_str("mooncake.tenant", tenant)
             .attribute_u64("mooncake.item_count", 1)
             .input_bytes(value.len() as u64);
-        let result = self.put_object(&ObjectRef::new(key).tenant(tenant), value, None);
+        let policy = compat_put_policy(None);
+        let result =
+            self.put_object(&ObjectRef::new(key).tenant(tenant), value, policy.as_ref());
         tracker.finish(&result, value.len() as u64);
         result
     }
@@ -1528,7 +1530,8 @@ impl MooncakeCompatibilityFacade for StoreClient {
             if let Some(qos_tier) = request.qos_tier {
                 object = object.qos_tier(qos_tier);
             }
-            routes.push(self.put_object(&object, request.value, request.policy.as_ref())?);
+            let policy = compat_put_policy(request.policy.as_ref());
+            routes.push(self.put_object(&object, request.value, policy.as_ref())?);
         }
         let result = Ok(routes);
         tracker.finish(&result, bytes_in);
@@ -1580,7 +1583,8 @@ impl MooncakeCompatibilityFacade for StoreClient {
             if let Some(qos_tier) = request.qos_tier {
                 object = object.qos_tier(qos_tier);
             }
-            routes.push(self.put_object(&object, &payload, request.policy.as_ref())?);
+            let policy = compat_put_policy(request.policy.as_ref());
+            routes.push(self.put_object(&object, &payload, policy.as_ref())?);
         }
         let result = Ok(routes);
         tracker.finish(&result, bytes_in);
@@ -2209,6 +2213,18 @@ fn multi_buffer_requests_have_device_targets(requests: &[MultiBufferGetRequest<'
                 ) == Some(true)
         })
     })
+}
+
+/// C++ Store's `ReplicateConfig` defaults `prefer_alloc_in_same_node` to
+/// false and lets the master spread replicas over all segments. Store-RS'
+/// library default prefers the writer's own segment, which concentrates every
+/// object of a single writer on one owner and turns multi-reader reads into a
+/// single-owner bottleneck. The compatibility facade follows the C++ default.
+fn compat_put_policy(policy: Option<&ReplicationPolicy>) -> Option<ReplicationPolicy> {
+    match policy {
+        Some(policy) => Some(policy.clone()),
+        None => Some(ReplicationPolicy::default().prefer_local(false)),
+    }
 }
 
 fn flatten_buffers_with_device_staging(buffers: &[&[u8]]) -> Result<Vec<u8>> {
