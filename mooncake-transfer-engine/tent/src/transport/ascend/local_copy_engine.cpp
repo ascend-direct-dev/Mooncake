@@ -17,7 +17,6 @@
 #include <glog/logging.h>
 
 #include <algorithm>
-#include <cstring>
 #include <condition_variable>
 
 #include "tent/common/utils/os.h"
@@ -272,15 +271,8 @@ Status LocalCopyEngine::submit(bool write, const std::vector<HixlOpDesc>& ops,
             void* remote = reinterpret_cast<void*>(op.remote_addr);
             void* src = write ? local : remote;
             void* dst = write ? remote : local;
-            const auto kind = memcpyKind(src, dst);
-            // Host-to-host copies (shared host segment imported into this
-            // process) are plain memory copies; ACL async H2H is unsupported
-            // on this CANN and fails with ret:207000.
-            if (kind == ACL_MEMCPY_HOST_TO_HOST) {
-                std::memcpy(dst, src, op.len);
-                continue;
-            }
-            auto ret = aclrtMemcpyAsync(dst, op.len, src, op.len, kind, stream);
+            auto ret = aclrtMemcpyAsync(dst, op.len, src, op.len,
+                                        memcpyKind(src, dst), stream);
             if (ret != ACL_ERROR_NONE) {
                 LOG(ERROR) << "aclrtMemcpyAsync failed, ret:" << ret
                            << ", errmsg:" << aclGetRecentErrMsg();
