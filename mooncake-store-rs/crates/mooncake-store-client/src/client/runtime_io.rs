@@ -2820,7 +2820,22 @@ impl StoreClient {
             tenant = entry.tenant.clone();
             let is_local = entry.replica.owner == self.lease.runtime
                 && local_segments.contains(&entry.replica.segment_name);
-            if is_local {
+            // NPU device destinations of *local* replicas: read through the
+            // transfer engine as well (same request shape as remote reads).
+            // TE turns a local-segment read into a local copy (D2H chosen by
+            // the local copy engine), so the store does not have to stage the
+            // object through host memory with a CPU copy followed by an ACL
+            // H2D copy -- that is what the C++ Store does for every replica.
+            let local_device_destination = if is_local {
+                runs_per_request[index].first().is_some_and(|run| {
+                    mooncake_store_rs_transport::ascend_pointer_is_device(
+                        run.dest as *mut c_void,
+                    ) == Some(true)
+                })
+            } else {
+                false
+            };
+            if is_local && !local_device_destination {
                 let open_segment_name =
                     self.local_transport_open_segment_name(&entry.replica.segment_name);
                 let info = {
@@ -2841,18 +2856,35 @@ impl StoreClient {
                         run.length,
                         max_registration_bytes,
                     )?;
-                    // NPU device destinations need a host staging buffer for
-                    // the CPU copy followed by an ACL H2D copy.
-                    let destination = run.dest as *mut c_void;
-                    let staged = if mooncake_store_rs_transport::ascend_pointer_is_device(
-                        destination,
-                    ) == Some(true)
-                    {
-                        Some(vec![0u8; run.length])
-                    } else {
-                        None
-                    };
-                    copy_instructions.push((instructions, run.dest as *mut u8, staged));
+                    copy_instructions.push((instructions, run.dest as *mut u8, None));
+                }
+            } else if is_local {
+                let open_segment_name =
+                    self.local_transport_open_segment_name(&entry.replica.segment_name);
+                let (segment, info) = {
+                    let mut state = self.state.lock();
+                    let (segment, mut info) =
+                        state.open_segment_with_info(transport, &open_segment_name)?;
+                    state.augment_segment_info_from_target_metadata(
+                        &mut info,
+                        &entry.replica.owner,
+                        &entry.replica.segment_name,
+                    );
+                    (segment, info)
+                };
+                let chunks = self.replica_target_chunks(&entry.replica)?;
+                let target_offset =
+                    Self::replica_storage_target_offset(&info, &chunks, &entry.replica)?;
+                for run in &runs_per_request[index] {
+                    remote_requests.extend(Self::target_buffer_transfer_requests(
+                        Opcode::Read,
+                        segment,
+                        target_offset + run.src_offset,
+                        run.dest as *mut c_void,
+                        run.length as u64,
+                        &info,
+                        max_registration_bytes,
+                    )?);
                 }
             } else {
                 let open_segment_name =
