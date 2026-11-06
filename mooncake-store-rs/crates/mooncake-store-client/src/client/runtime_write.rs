@@ -691,6 +691,19 @@ impl StoreClient {
                         });
                     }
                 }
+                // C++ Store always has a master-chosen segment. A masterless
+                // client can race peer announcements, so keep the local
+                // segment as a last resort instead of failing the whole put.
+                if self.can_prefer_local_storage_for_write_mode()
+                    && seen.insert(self.lease.runtime.clone())
+                {
+                    candidates.push(ReplicaPlacementCandidate {
+                        target: ReplicaPlacementTarget::StorageRuntime(
+                            self.lease.runtime.clone(),
+                        ),
+                        soft: true,
+                    });
+                }
                 if candidates.is_empty() {
                     return Err(BatchPutReserveStageError::retryable(
                         StoreError::InvalidState(format!(
