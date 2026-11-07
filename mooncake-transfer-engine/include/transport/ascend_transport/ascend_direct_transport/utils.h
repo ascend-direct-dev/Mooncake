@@ -46,6 +46,15 @@ namespace mooncake {
     ::mooncake::ScopeGuard make_guard_##var(callback)
 #define DISMISS_GUARD(var) make_guard_##var.Dismiss()
 
+// BufferDesc::device_id marker for a store segment that a standalone holder
+// registered on all of its local engines
+// (ASCEND_STANDALONE_USE_SINGLE_SEGMENT). The advertised device is not a single
+// NPU, so a transfer to such a buffer is routed to the target segment endpoint
+// whose index equals the requester's device (client card N -> holder card N).
+// Unlike the regular device ids, the marker is negative on purpose: it must
+// never be confused with an engine index.
+constexpr int32_t kSharedSegmentDeviceId = -2;
+
 class ScopeGuard {
    public:
     ScopeGuard(const ScopeGuard &) = delete;

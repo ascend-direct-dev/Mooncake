@@ -937,15 +937,50 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         const size_t alignment = facebook::cachelib::Slab::kSize;
 #ifdef USE_ASCEND_DIRECT
         if (protocol == "ascend" && globalConfig().ascend_agent_mode) {
-            const size_t cap = AgentModeStoreChunkCap(global_segment_size);
-            if (cap > 0) {
-                if (!split_limit.has_value() || cap < *split_limit) {
-                    split_limit = cap;
+            if (globalConfig().ascend_standalone_single_segment) {
+                // Single-segment layout: skip the per-device cap so the loop
+                // below mounts the whole store size once. split_limit stays
+                // nullopt (ascend has no registration limit), hence
+                // GetNextSegmentSize() returns the full size and mount_size
+                // falls back to mapped_size. The requested size is used as-is,
+                // like any other transport without a registration limit, so
+                // Slab::kSize alignment is only required when the master runs
+                // the cachelib allocator; hugepage or fabric allocation can
+                // still round mapped_size up, or down (fabric best effort).
+                // RestoreAgentModeDeviceZero() is unaffected: the single
+                // allocation advances the round-robin slot once and only the
+                // caller's context needs restoring.
+                if (global_segment_size > 0) {
+                    LOG(INFO) << "Agent mode mounts the store segment of "
+                              << global_segment_size
+                              << " bytes as one segment for "
+                              << ContextManager::getInstance().getDeviceCount()
+                              << " local engine(s)";
+                    if (use_hugepage_ || globalConfig().ascend_use_fabric_mem) {
+                        // The transfer engine recognizes the shared segment by
+                        // the allocator's store-memory bookkeeping. Hugepage
+                        // host_alloc mappings and adxl::MallocMem fabric
+                        // allocations are not recorded there, so the segment
+                        // may be registered on one engine only.
+                        LOG(WARNING)
+                            << "ASCEND_STANDALONE_USE_SINGLE_SEGMENT with "
+                               "hugepage/fabric store memory: the allocation "
+                               "is not recorded as store memory, the transfer "
+                               "engine may not register it on every engine";
+                    }
                 }
-                LOG(INFO) << "Agent-mode store chunk cap: " << cap
-                          << " bytes across "
-                          << ContextManager::getInstance().getDeviceCount()
-                          << " device(s)";
+            } else {
+                const size_t cap = AgentModeStoreChunkCap(global_segment_size);
+                if (cap > 0) {
+                    if (!split_limit.has_value() || cap < *split_limit) {
+                        split_limit = cap;
+                    }
+                    LOG(INFO) << "Agent mode splits the store segment of "
+                              << global_segment_size << " bytes across "
+                              << ContextManager::getInstance().getDeviceCount()
+                              << " devices, at most " << cap
+                              << " bytes on each device";
+                }
             }
         }
 #endif
@@ -1017,7 +1052,9 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             }
 
             if (!ptr) {
-                LOG(ERROR) << "Failed to allocate segment memory";
+                LOG(ERROR) << "Failed to allocate store segment memory: "
+                           << "requested " << segment_size << " bytes, mapped "
+                           << mapped_size << ", protocol " << protocol;
                 return tl::unexpected(ErrorCode::INVALID_PARAMS);
             }
             const size_t mount_size =

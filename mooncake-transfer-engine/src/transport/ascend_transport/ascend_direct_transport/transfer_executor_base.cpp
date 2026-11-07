@@ -25,6 +25,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <numeric>
 #include <unistd.h>
 
 #include "common.h"
@@ -44,12 +45,54 @@ void markSlicesFailed(const std::vector<Transport::Slice*>& slice_list) {
     }
 }
 
+int CurrentEngineIndex(size_t engine_count, size_t& engine_idx) {
+    if (engine_count == 1) {
+        engine_idx = 0;
+        return 0;
+    }
+    int32_t current_device_id = 0;
+    CHECK_ACL(aclrtGetDevice(&current_device_id));
+    engine_idx = static_cast<size_t>(current_device_id);
+    if (engine_idx >= engine_count) {
+        LOG(ERROR) << "Invalid device id:" << current_device_id;
+        return -1;
+    }
+    return 0;
+}
+}  // namespace
+
 std::string EngineNameForDestAddr(
     const std::vector<TransferMetadata::BufferDesc>& buffers,
-    const std::vector<std::string>& endpoints, uint64_t dest_addr) {
+    const std::vector<std::string>& endpoints, uint64_t dest_addr,
+    int32_t requester_device_id) {
+    if (endpoints.empty()) {
+        LOG(ERROR) << "Cannot resolve the target engine: segment publishes no "
+                      "endpoint";
+        return {};
+    }
     for (const auto& buf : buffers) {
         if (dest_addr < buf.addr || dest_addr - buf.addr >= buf.length) {
             continue;
+        }
+        if (buf.device_id == kSharedSegmentDeviceId) {
+            // A standalone holder's store segment is registered on every local
+            // engine, so its device is not a single engine index. The
+            // requester's device picks the peer endpoint: client card N -> the
+            // holder's card N.
+            if (requester_device_id >= 0 &&
+                static_cast<size_t>(requester_device_id) < endpoints.size()) {
+                const auto idx = static_cast<size_t>(requester_device_id);
+                LOG_FIRST_N(INFO, 1)
+                    << "Shared store segment: routing to endpoint "
+                    << endpoints[idx] << " for requester device "
+                    << requester_device_id;
+                return endpoints[idx];
+            }
+            LOG(WARNING) << "Shared store buffer at " << dest_addr
+                         << " cannot route by requester device_id="
+                         << requester_device_id << " with " << endpoints.size()
+                         << " endpoints, falling back to " << endpoints.front();
+            return endpoints.front();
         }
         if (buf.device_id < 0) {
             LOG(WARNING) << "Dest buffer at " << dest_addr
@@ -70,22 +113,6 @@ std::string EngineNameForDestAddr(
                  << " matches no buffer, falling back to " << endpoints.front();
     return endpoints.front();
 }
-
-int CurrentEngineIndex(size_t engine_count, size_t& engine_idx) {
-    if (engine_count == 1) {
-        engine_idx = 0;
-        return 0;
-    }
-    int32_t current_device_id = 0;
-    CHECK_ACL(aclrtGetDevice(&current_device_id));
-    engine_idx = static_cast<size_t>(current_device_id);
-    if (engine_idx >= engine_count) {
-        LOG(ERROR) << "Invalid device id:" << current_device_id;
-        return -1;
-    }
-    return 0;
-}
-}  // namespace
 
 TransferExecutorBase::TransferExecutorBase(const InitParams& params)
     : params_(params),
@@ -468,7 +495,8 @@ void TransferExecutorBase::rollbackRegisteredMem(
 
 int TransferExecutorBase::registerMem(void* addr, size_t length,
                                       adxl::MemType mem_type,
-                                      bool use_buffer_pool) {
+                                      bool use_buffer_pool,
+                                      bool register_on_all_engines) {
     if (mem_type == adxl::MEM_HOST && use_buffer_pool) {
         LOG(INFO) << "Ignore register host mem:" << addr
                   << " when buffer pool is enabled.";
@@ -489,11 +517,18 @@ int TransferExecutorBase::registerMem(void* addr, size_t length,
                [saved_ctx]() { (void)aclrtSetCurrentContext(saved_ctx); });
 
     std::vector<size_t> engine_indices;
-    size_t engine_idx = 0;
-    if (CurrentEngineIndex(adxl_engines_.size(), engine_idx) != 0) {
-        return -1;
+    if (register_on_all_engines && adxl_engines_.size() > 1) {
+        // A shared store segment belongs to every local engine, not only to
+        // the engine of the device that happened to allocate it.
+        engine_indices.resize(adxl_engines_.size());
+        std::iota(engine_indices.begin(), engine_indices.end(), size_t{0});
+    } else {
+        size_t engine_idx = 0;
+        if (CurrentEngineIndex(adxl_engines_.size(), engine_idx) != 0) {
+            return -1;
+        }
+        engine_indices = {engine_idx};
     }
-    engine_indices = {engine_idx};
 
     adxl::MemDesc mem_desc{};
     mem_desc.addr = reinterpret_cast<uintptr_t>(addr);
@@ -584,10 +619,39 @@ int TransferExecutorBase::deregisterMem(void* addr) {
 
 std::string TransferExecutorBase::resolveTargetAdxlEngineName(
     const std::shared_ptr<TransferMetadata::SegmentDesc>& segment_desc,
-    uint64_t dest_addr) const {
+    uint64_t dest_addr, int32_t requester_device_id) const {
     const auto& endpoints = segment_desc->rank_info.endpoints;
     if (endpoints.empty()) return {};
-    return EngineNameForDestAddr(segment_desc->buffers, endpoints, dest_addr);
+    return EngineNameForDestAddr(segment_desc->buffers, endpoints, dest_addr,
+                                 requester_device_id);
+}
+
+int32_t TransferExecutorBase::resolveRequesterDeviceId(
+    const Transport::Slice& slice) const {
+    const int32_t engine_id = slice.ascend_direct.engine_id;
+    // Agent mode dispatches one group per local engine and carries the engine
+    // index on the slice; every other TE runs on engine 0 and its device is
+    // local_engine_device_ids[0].
+    const size_t requester_engine_idx = params_.agent_mode && engine_id >= 0
+                                            ? static_cast<size_t>(engine_id)
+                                            : 0;
+    if (requester_engine_idx < params_.local_engine_device_ids.size()) {
+        return params_.local_engine_device_ids[requester_engine_idx];
+    }
+    // No device map (e.g. an executor built without InitParams). In agent mode
+    // the engine index is the device index on this host; otherwise the current
+    // device is the only device this process runs on.
+    if (params_.agent_mode && engine_id >= 0) {
+        return engine_id;
+    }
+    int32_t current_device_id = -1;
+    if (aclrtGetDevice(&current_device_id) != ACL_ERROR_NONE) {
+        LOG(WARNING) << "Cannot resolve the requester device for a shared "
+                        "store segment: aclrtGetDevice failed, errmsg: "
+                     << aclGetRecentErrMsg();
+        return -1;
+    }
+    return current_device_id;
 }
 
 void TransferExecutorBase::processSliceList(
@@ -607,7 +671,8 @@ void TransferExecutorBase::processSliceList(
     std::map<std::string, std::vector<Transport::Slice*>> groups;
     for (auto* slice : slice_list) {
         groups[resolveTargetAdxlEngineName(target_segment_desc,
-                                           slice->ascend_direct.dest_addr)]
+                                           slice->ascend_direct.dest_addr,
+                                           resolveRequesterDeviceId(*slice))]
             .push_back(slice);
     }
     for (auto& [_, group] : groups) {
@@ -657,7 +722,8 @@ void TransferExecutorBase::processHomogeneousSliceList(
             return;
         }
         target_adxl_engine_name = resolveTargetAdxlEngineName(
-            target_segment_desc, slice_list[0]->ascend_direct.dest_addr);
+            target_segment_desc, slice_list[0]->ascend_direct.dest_addr,
+            resolveRequesterDeviceId(*slice_list[0]));
         if (target_adxl_engine_name.empty()) {
             LOG(ERROR) << "Invalid local_engine_idx: " << local_engine_idx
                        << " target endpoint size:"

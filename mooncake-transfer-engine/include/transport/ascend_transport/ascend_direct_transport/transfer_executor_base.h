@@ -34,6 +34,18 @@ namespace mooncake {
 
 class LocalCopyEngine;
 
+// Resolves which endpoint of the target segment a slice is sent to.
+// `requester_device_id` is the device this transfer runs from; it selects the
+// endpoint only for buffers stamped with kSharedSegmentDeviceId, i.e. a store
+// segment that a standalone holder registered on all of its local engines.
+// Every other buffer keeps the historical rule: device_id is the target engine
+// index. Unknown device ids (negative, or >= endpoint count) fall back to the
+// first endpoint.
+std::string EngineNameForDestAddr(
+    const std::vector<TransferMetadata::BufferDesc>& buffers,
+    const std::vector<std::string>& endpoints, uint64_t dest_addr,
+    int32_t requester_device_id);
+
 /**
  * TransferExecutorBase: Base class with common ADXL logic shared by
  * sync and async transfer. Holds engines, connection state, memory
@@ -61,6 +73,10 @@ class TransferExecutorBase {
         bool roce_mode = false;
         bool use_fabric_mem = false;
         bool client_server_mode = false;
+        // ACL logic device ids, same order as local_engine_contexts_. A
+        // non-agent TE always runs on engine 0, but the real device is this
+        // entry, not the literal 0.
+        std::vector<int32_t> local_engine_device_ids;
     };
 
     explicit TransferExecutorBase(const InitParams& params);
@@ -79,7 +95,7 @@ class TransferExecutorBase {
     void processSliceList(const std::vector<Transport::Slice*>& slice_list);
 
     int registerMem(void* addr, size_t length, adxl::MemType mem_type,
-                    bool use_buffer_pool);
+                    bool use_buffer_pool, bool register_on_all_engines = false);
     int deregisterMem(void* addr);
 
     const size_t getNumEngines() const { return adxl_engines_.size(); }
@@ -105,7 +121,12 @@ class TransferExecutorBase {
                    int32_t timeout_in_millis);
     std::string resolveTargetAdxlEngineName(
         const std::shared_ptr<TransferMetadata::SegmentDesc>& segment_desc,
-        uint64_t dest_addr) const;
+        uint64_t dest_addr, int32_t requester_device_id) const;
+    // Device this transfer runs from, used to route a shared store segment.
+    // Agent mode carries the engine index on the slice; a non-agent TE always
+    // runs on engine 0. Falls back to aclrtGetDevice if the params carry no
+    // device map.
+    int32_t resolveRequesterDeviceId(const Transport::Slice& slice) const;
     void processHomogeneousSliceList(
         const std::vector<Transport::Slice*>& slice_list);
 

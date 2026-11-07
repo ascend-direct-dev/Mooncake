@@ -752,7 +752,7 @@ class AscendDirectTransportTest : public ::testing::Test {
         remote_desc->protocol = "ascend";
         remote_desc->rank_info.hostIp = host_ip;
         remote_desc->rank_info.endpoints = endpoints;
-        if (dest_device_id >= 0 && dest_len > 0) {
+        if (dest_len > 0) {
             TransferMetadata::BufferDesc buffer;
             buffer.name = "store";
             buffer.addr = dest_addr;
@@ -2633,6 +2633,299 @@ TEST_F(ClientServerModeTest, UserEnvOverridesAutoInject) {
     auto it = opts.find("adxl.LocalCommRes");
     ASSERT_NE(it, opts.end());
     EXPECT_EQ(it->second, R"({"version":"1.2"})");
+}
+
+// Standalone single-segment layout (ASCEND_STANDALONE_USE_SINGLE_SEGMENT):
+// one store segment is published for the whole global size, so it is
+// registered on every local engine and stamped with the shared marker instead
+// of the device that allocated it.
+TEST_F(AscendDirectTransportTest,
+       DummyReal_SingleSegment_RegistersStoreMemoryOnAllEngines) {
+    // The single-segment layout is a Store-TE property.
+    globalConfig().ascend_agent_mode = true;
+    globalConfig().ascend_store_te_init = true;
+    globalConfig().ascend_standalone_single_segment = true;
+    ContextManager::getInstance().finalize();
+    constexpr int kEngineCount = 4;
+    mock_acl::set_device_count(kEngineCount);
+    ASSERT_TRUE(ContextManager::getInstance().initialize())
+        << "Re-init ContextManager for single-segment registration test";
+    unsetenv("HCCL_INTRA_ROCE_ENABLE");
+
+    auto transport = createTransport();
+    ASSERT_NE(transport, nullptr);
+    ASSERT_EQ(adxl_mock::get_register_mem_count(), 0);
+
+    void* store_buffer = ascend_allocate_memory(kRegisterMemSize, "ascend");
+    ASSERT_NE(store_buffer, nullptr);
+
+    ASSERT_EQ(transport->registerLocalMemory(store_buffer, kRegisterMemSize,
+                                             "cpu:0", true, true),
+              0);
+    EXPECT_EQ(adxl_mock::get_register_mem_count(), kEngineCount)
+        << "A shared store segment must be registered on every local engine";
+    auto segment_desc = transport->meta()->getSegmentDescByID(LOCAL_SEGMENT_ID);
+    ASSERT_NE(segment_desc, nullptr);
+    ASSERT_FALSE(segment_desc->buffers.empty());
+    EXPECT_EQ(segment_desc->buffers.back().device_id, kSharedSegmentDeviceId)
+        << "Routing follows the requester's device, not the allocating one";
+
+    ASSERT_EQ(transport->unregisterLocalMemory(store_buffer, true), 0);
+    EXPECT_EQ(adxl_mock::get_deregister_mem_count(), kEngineCount);
+
+    auto registered_handles = adxl_mock::get_registered_mem_handles();
+    auto deregistered_handles = adxl_mock::get_deregistered_mem_handles();
+    std::sort(registered_handles.begin(), registered_handles.end());
+    std::sort(deregistered_handles.begin(), deregistered_handles.end());
+    EXPECT_EQ(deregistered_handles, registered_handles);
+
+    ascend_free_memory("ascend", store_buffer);
+    globalConfig().ascend_standalone_single_segment = false;
+    globalConfig().ascend_store_te_init = false;
+    globalConfig().ascend_agent_mode = false;
+}
+
+// Buffers that are not store memory keep the historical registration: one
+// engine, the device they were registered under.
+TEST_F(AscendDirectTransportTest,
+       DummyReal_SingleSegment_NonStoreMemoryKeepsPerDeviceRegistration) {
+    globalConfig().ascend_agent_mode = true;
+    globalConfig().ascend_standalone_single_segment = true;
+    ContextManager::getInstance().finalize();
+    constexpr int kEngineCount = 4;
+    mock_acl::set_device_count(kEngineCount);
+    ASSERT_TRUE(ContextManager::getInstance().initialize())
+        << "Re-init ContextManager for non-store registration test";
+    unsetenv("HCCL_INTRA_ROCE_ENABLE");
+
+    auto transport = createTransport();
+    ASSERT_NE(transport, nullptr);
+
+    ASSERT_EQ(transport->registerLocalMemory(test_buffer_src_, kRegisterMemSize,
+                                             "cpu:0", true, true),
+              0);
+    EXPECT_EQ(adxl_mock::get_register_mem_count(), 1)
+        << "Only store memory is a shared segment";
+    auto segment_desc = transport->meta()->getSegmentDescByID(LOCAL_SEGMENT_ID);
+    ASSERT_NE(segment_desc, nullptr);
+    ASSERT_FALSE(segment_desc->buffers.empty());
+    EXPECT_NE(segment_desc->buffers.back().device_id, kSharedSegmentDeviceId);
+    EXPECT_GE(segment_desc->buffers.back().device_id, 0);
+
+    ASSERT_EQ(transport->unregisterLocalMemory(test_buffer_src_, true), 0);
+    EXPECT_EQ(adxl_mock::get_deregister_mem_count(), 1);
+
+    // Local-only store memory (allocated through the same allocator but not
+    // published to peers) is not a shared segment either.
+    void* local_store = ascend_allocate_memory(kRegisterMemSize, "ascend");
+    ASSERT_NE(local_store, nullptr);
+    ASSERT_EQ(
+        transport->registerLocalMemory(local_store, kRegisterMemSize, "cpu:0",
+                                       /*remote_accessible=*/false, true),
+        0);
+    EXPECT_EQ(adxl_mock::get_register_mem_count(), 2);
+    segment_desc = transport->meta()->getSegmentDescByID(LOCAL_SEGMENT_ID);
+    ASSERT_NE(segment_desc, nullptr);
+    EXPECT_GE(segment_desc->buffers.back().device_id, 0);
+    ASSERT_EQ(transport->unregisterLocalMemory(local_store, true), 0);
+    EXPECT_EQ(adxl_mock::get_deregister_mem_count(), 2);
+    ascend_free_memory("ascend", local_store);
+
+    globalConfig().ascend_standalone_single_segment = false;
+    globalConfig().ascend_agent_mode = false;
+}
+
+// An agent-mode (standalone/dummy-real) TE carries the engine index on the
+// slice; the requester device is that engine's device, so a transfer to a
+// peer's shared store segment still targets the peer's same-numbered card.
+TEST_F(AscendDirectTransportTest,
+       DummyReal_SharedMarker_RoutesBySliceEngineDevice) {
+    globalConfig().ascend_agent_mode = true;
+    ContextManager::getInstance().finalize();
+    constexpr int kEngineCount = 4;
+    mock_acl::set_device_count(kEngineCount);
+    ASSERT_TRUE(ContextManager::getInstance().initialize())
+        << "Re-init ContextManager for agent-mode routing test";
+    unsetenv("HCCL_INTRA_ROCE_ENABLE");
+
+    auto transport = createTransport();
+    ASSERT_NE(transport, nullptr);
+
+    // Register from card 2, so both the source buffer and the transfer belong
+    // to engine 2.
+    g_device_id = 2;
+    g_context = ContextForDevice(2);
+    ASSERT_EQ(transport->registerLocalMemory(test_buffer_src_, kRegisterMemSize,
+                                             "cpu:0", true, true),
+              0);
+
+    std::vector<std::string> endpoints = {"10.0.0.5:12000", "10.0.0.5:12100",
+                                          "10.0.0.5:12200", "10.0.0.5:12300"};
+    addMultiEndpointRemoteSegment(
+        transport->meta(), 1, "peer_shared_store", "10.0.0.5", endpoints,
+        /*dest_device_id=*/kSharedSegmentDeviceId, 0x10000, kTransferBufSize);
+
+    initTestData(kTransferBufSize);
+    auto result = runRemoteTransfer(transport.get(), test_buffer_src_, 1,
+                                    0x10000, kTransferBufSize);
+    ASSERT_TRUE(result.finished);
+    EXPECT_FALSE(result.failed);
+    EXPECT_EQ(adxl_mock::get_last_connect_target(), "10.0.0.5:12200")
+        << "The requester device is the device of the slice's engine";
+
+    globalConfig().ascend_agent_mode = false;
+}
+
+// -----------------------------------------------------------------------------
+// Batch tests
+// -----------------------------------------------------------------------------
+
+TEST_F(AscendDirectTransportTest,
+       Standalone_SharedMarker_RoutesByRequesterDevice) {
+    globalConfig().ascend_agent_mode = false;
+    unsetenv("HCCL_INTRA_ROCE_ENABLE");
+    constexpr int kDeviceCount = 4;
+    mock_acl::set_device_count(kDeviceCount);
+    g_device_id = 2;
+    auto transport = createTransport();
+    ASSERT_NE(transport, nullptr);
+    ASSERT_EQ(transport->registerLocalMemory(test_buffer_src_, kRegisterMemSize,
+                                             "cpu:0", true, true),
+              0);
+
+    std::vector<std::string> endpoints = {"127.0.0.1:10000", "127.0.0.1:10100",
+                                          "127.0.0.1:10200", "127.0.0.1:10300"};
+    addMultiEndpointRemoteSegment(
+        transport->meta(), 1, "shared_store", "127.0.0.1", endpoints,
+        /*dest_device_id=*/kSharedSegmentDeviceId, 0x10000, kTransferBufSize);
+
+    initTestData(kTransferBufSize);
+    auto result = runRemoteTransfer(transport.get(), test_buffer_src_, 1,
+                                    0x10000, kTransferBufSize);
+    ASSERT_TRUE(result.finished);
+    EXPECT_FALSE(result.failed);
+    EXPECT_EQ(adxl_mock::get_last_connect_target(), "127.0.0.1:10200")
+        << "A shared store buffer routes to the peer endpoint that matches "
+           "this process's device (card N -> peer card N)";
+}
+
+TEST_F(AscendDirectTransportTest,
+       Standalone_SharedMarker_OutOfRangeFallsBackToFront) {
+    globalConfig().ascend_agent_mode = false;
+    unsetenv("HCCL_INTRA_ROCE_ENABLE");
+    constexpr int kDeviceCount = 4;
+    mock_acl::set_device_count(kDeviceCount);
+    g_device_id = 3;
+    auto transport = createTransport();
+    ASSERT_NE(transport, nullptr);
+    ASSERT_EQ(transport->registerLocalMemory(test_buffer_src_, kRegisterMemSize,
+                                             "cpu:0", true, true),
+              0);
+
+    std::vector<std::string> endpoints = {"127.0.0.1:11000", "127.0.0.1:11100"};
+    addMultiEndpointRemoteSegment(
+        transport->meta(), 1, "shared_short", "127.0.0.1", endpoints,
+        /*dest_device_id=*/kSharedSegmentDeviceId, 0x10000, kTransferBufSize);
+
+    initTestData(kTransferBufSize);
+    auto result = runRemoteTransfer(transport.get(), test_buffer_src_, 1,
+                                    0x10000, kTransferBufSize);
+    ASSERT_TRUE(result.finished);
+    EXPECT_FALSE(result.failed);
+    EXPECT_EQ(adxl_mock::get_last_connect_target(), "127.0.0.1:11000")
+        << "A requester device the target segment does not publish falls back "
+           "to the first endpoint";
+}
+
+// -----------------------------------------------------------------------------
+// Target engine resolution (pure logic, no ACL/ADXL involvement)
+// -----------------------------------------------------------------------------
+
+namespace {
+TransferMetadata::BufferDesc MakeDestBuffer(int32_t device_id, uint64_t addr,
+                                            uint64_t length) {
+    TransferMetadata::BufferDesc buffer;
+    buffer.name = "store";
+    buffer.addr = addr;
+    buffer.length = length;
+    buffer.device_id = device_id;
+    return buffer;
+}
+
+constexpr uint64_t kRouteDestAddr = 0x10000;
+constexpr uint64_t kRouteDestLen = 4096;
+}  // namespace
+
+TEST(EngineNameForDestAddrTest, SharedMarkerRoutesByRequesterDevice) {
+    const std::vector<std::string> endpoints = {"e0", "e1", "e2", "e3"};
+    const std::vector<TransferMetadata::BufferDesc> buffers = {
+        MakeDestBuffer(kSharedSegmentDeviceId, kRouteDestAddr, kRouteDestLen)};
+
+    EXPECT_EQ(EngineNameForDestAddr(buffers, endpoints, kRouteDestAddr, 0),
+              "e0");
+    EXPECT_EQ(EngineNameForDestAddr(buffers, endpoints, kRouteDestAddr, 2),
+              "e2");
+    EXPECT_EQ(EngineNameForDestAddr(buffers, endpoints,
+                                    kRouteDestAddr + kRouteDestLen - 1, 3),
+              "e3");
+}
+
+TEST(EngineNameForDestAddrTest, SharedMarkerOutOfRangeFallsBackToFront) {
+    const std::vector<std::string> endpoints = {"e0", "e1"};
+    const std::vector<TransferMetadata::BufferDesc> buffers = {
+        MakeDestBuffer(kSharedSegmentDeviceId, kRouteDestAddr, kRouteDestLen)};
+
+    EXPECT_EQ(EngineNameForDestAddr(buffers, endpoints, kRouteDestAddr, 2),
+              "e0");
+    EXPECT_EQ(EngineNameForDestAddr(buffers, endpoints, kRouteDestAddr, -1),
+              "e0");
+    EXPECT_EQ(EngineNameForDestAddr(buffers, endpoints, kRouteDestAddr,
+                                    kSharedSegmentDeviceId),
+              "e0");
+}
+
+TEST(EngineNameForDestAddrTest, SharedMarkerSingleEndpointUsesIt) {
+    const std::vector<std::string> endpoints = {"only"};
+    const std::vector<TransferMetadata::BufferDesc> buffers = {
+        MakeDestBuffer(kSharedSegmentDeviceId, kRouteDestAddr, kRouteDestLen)};
+
+    EXPECT_EQ(EngineNameForDestAddr(buffers, endpoints, kRouteDestAddr, 3),
+              "only");
+}
+
+TEST(EngineNameForDestAddrTest, RegularBufferRoutesByDeviceId) {
+    const std::vector<std::string> endpoints = {"e0", "e1", "e2", "e3"};
+    const std::vector<TransferMetadata::BufferDesc> buffers = {
+        MakeDestBuffer(2, kRouteDestAddr, kRouteDestLen)};
+
+    // The requester's device is ignored: a regular buffer carries the target
+    // engine index in device_id.
+    EXPECT_EQ(EngineNameForDestAddr(buffers, endpoints, kRouteDestAddr, 0),
+              "e2");
+    EXPECT_EQ(EngineNameForDestAddr(buffers, endpoints, kRouteDestAddr, 3),
+              "e2");
+}
+
+TEST(EngineNameForDestAddrTest, RegularBufferDeviceIdOutOfRangeFallsBack) {
+    const std::vector<std::string> endpoints = {"e0", "e1"};
+    EXPECT_EQ(EngineNameForDestAddr(
+                  {MakeDestBuffer(5, kRouteDestAddr, kRouteDestLen)}, endpoints,
+                  kRouteDestAddr, 0),
+              "e0");
+    EXPECT_EQ(EngineNameForDestAddr(
+                  {MakeDestBuffer(-1, kRouteDestAddr, kRouteDestLen)},
+                  endpoints, kRouteDestAddr, 1),
+              "e0");
+}
+
+TEST(EngineNameForDestAddrTest, UnmatchedDestAddrFallsBackToFront) {
+    const std::vector<std::string> endpoints = {"e0", "e1", "e2"};
+    const std::vector<TransferMetadata::BufferDesc> buffers = {
+        MakeDestBuffer(kSharedSegmentDeviceId, kRouteDestAddr, kRouteDestLen)};
+
+    EXPECT_EQ(EngineNameForDestAddr(buffers, endpoints,
+                                    kRouteDestAddr + kRouteDestLen, 2),
+              "e0");
 }
 
 int main(int argc, char** argv) {

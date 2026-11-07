@@ -633,6 +633,20 @@ void loadGlobalConfig(GlobalConfig& config) {
         }
     }
 
+    // Ascend standalone (agent-mode) store layout. Off keeps the historical
+    // behavior: the global segment is split across the local NPU devices and
+    // each chunk is pinned to the engine of the device it was allocated on.
+    // On mounts one segment for the whole global size, registers it on every
+    // local engine, and routes transfers to the peer engine whose device index
+    // matches the requester's device.
+    const char* ascend_standalone_single_segment_env =
+        std::getenv("ASCEND_STANDALONE_USE_SINGLE_SEGMENT");
+    if (ascend_standalone_single_segment_env) {
+        parseBoolConfigEnv(ascend_standalone_single_segment_env,
+                           "ASCEND_STANDALONE_USE_SINGLE_SEGMENT",
+                           config.ascend_standalone_single_segment);
+    }
+
     const char* endpoint_store_type_env = std::getenv("MC_ENDPOINT_STORE_TYPE");
     if (endpoint_store_type_env) {
         if (strcmp(endpoint_store_type_env, "FIFO") == 0) {

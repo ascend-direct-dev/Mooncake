@@ -50,6 +50,7 @@ The following environment variables can be configured to control Ascend Direct T
 |----------|-------------|---------------|---------|
 | `ASCEND_AUTO_CONNECT` | Enable automatic connection management | 1 (enabled) | `ASCEND_AUTO_CONNECT=0` |
 | `ASCEND_ENABLE_USE_FABRIC_MEM` | Enable fabric memory transfer mode in Mooncake Store (A3 only) | 0 (disabled) | `ASCEND_ENABLE_USE_FABRIC_MEM=1` |
+| `ASCEND_STANDALONE_USE_SINGLE_SEGMENT` | Standalone Store layout: one store segment for the whole global segment size, registered on every local engine, with client card N routed to the peer card-N engine (classic Ascend Direct TE only) | 0 (disabled) | `ASCEND_STANDALONE_USE_SINGLE_SEGMENT=1` |
 | `ASCEND_USE_ASYNC_TRANSFER` | Enable asynchronous transfer mode | 0 (disabled) | `ASCEND_USE_ASYNC_TRANSFER=1` |
 | `ASCEND_GLOBAL_RESOURCE_CONFIG` | Global resource configuration | - | `ASCEND_GLOBAL_RESOURCE_CONFIG="{\"fabric_memory.max_capacity\":32}"` |
 | `ASCEND_CONNECT_TIMEOUT` | Link establishment timeout in milliseconds | 3000 | `ASCEND_CONNECT_TIMEOUT=5000` |
@@ -66,6 +67,7 @@ The following environment variables can be configured to control Ascend Direct T
 
 - **ASCEND_AUTO_CONNECT**: Requires CANN 9.0 or later. Default is 1: link can be automatically disconnected when the remote end goes offline abnormally. Set `ASCEND_AUTO_CONNECT=0` to disable.
 - **ASCEND_ENABLE_USE_FABRIC_MEM**: Requires CANN 9.0+ and HDK 26.0+. Recommended when using Mooncake Store on supported A3 platforms: it can significantly improve transmission performance.
+- **ASCEND_STANDALONE_USE_SINGLE_SEGMENT**: Applies to the standalone (agent-mode) Ascend Store holder launched by `mooncake_client`. Default 0 keeps the historical layout: `--global_segment_size` is split across the local NPU devices and each chunk is pinned to the ADXL engine of the device that allocated it. When set to 1, the holder allocates one segment for the whole size, registers it on every local engine, and a client running on card N routes its transfers to the holder's card-N engine. Only the classic Ascend Direct transport implements the transfer side. Fabric-memory (`ASCEND_ENABLE_USE_FABRIC_MEM`) and hugepage (`MC_STORE_USE_HUGEPAGE`) store allocations are not tracked as store memory by the Ascend allocator, so keep the default layout when either is enabled.
 - **ASCEND_USE_ASYNC_TRANSFER**: Requires CANN 8.5+. Enables HIXL asynchronous transfer mode, defaults to synchronous mode.
 - **ASCEND_GLOBAL_RESOURCE_CONFIG**: Configures HIXL global resources. Refer to HIXL documentation for `OPTION_GLOBAL_RESOURCE_CONFIG` settings.
 

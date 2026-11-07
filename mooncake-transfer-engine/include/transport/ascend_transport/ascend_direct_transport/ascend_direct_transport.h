@@ -87,12 +87,20 @@ class AscendDirectTransport : public Transport {
     // context.
     bool agent_mode_{false};
     bool roce_mode_{false};
+    // ASCEND_STANDALONE_USE_SINGLE_SEGMENT on a standalone holder: the store
+    // segment this process publishes is registered on every local engine and
+    // its buffer descriptors carry kSharedSegmentDeviceId instead of the
+    // device that allocated it, so a requester's card N is routed to card N.
+    bool single_segment_agent_{false};
     // Whether this TE uses Ascend fabric memory (host mem for Store, e.g. RoCE
     // D2H/H2D). Captured once at install time from globalConfig() and gated on
     // ascend_store_te_init, so a non-Store (e.g. P2P/HCCS) TE never inherits a
     // Store TE's fabric setting that leaked into the process-global flag. All
     // transfer-time decisions read this member, not the global.
     bool use_fabric_mem_{false};
+    // ACL logic device id of each local engine, same order as
+    // local_engine_contexts_ and the published endpoints.
+    std::vector<int32_t> local_engine_device_ids_;
     std::vector<aclrtContext> local_engine_contexts_;
 
     std::unique_ptr<TransferExecutorBase> transfer_executor_;

@@ -152,6 +152,14 @@ struct GlobalConfig {
     int ib_pci_relaxed_ordering_mode = 1;
     bool ascend_use_fabric_mem = false;
     bool ascend_agent_mode = false;
+    // ASCEND_STANDALONE_USE_SINGLE_SEGMENT (default 0). Standalone
+    // (agent-mode) Ascend Store layout switch: off keeps the historical
+    // round-robin split of the global segment across local NPU devices (one
+    // chunk per device, each chunk pinned to the engine of the device it was
+    // allocated on). On mounts one segment for the whole global size,
+    // registers it on every local engine, and routes a transfer to the peer
+    // engine whose device index matches the requester's device.
+    bool ascend_standalone_single_segment = false;
     bool sunrise_use_device_mem = false;
     // Transient flag scoped to a single TE init: set true by the Store entry
     // (Client::InitTransferEngine) before installing the ascend transport, and

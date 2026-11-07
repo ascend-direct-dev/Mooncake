@@ -137,9 +137,35 @@ int AscendDirectTransport::install(std::string &local_server_name,
         return ret;
     }
 
+    // Single-segment store layout is a standalone-holder property: only the
+    // agent-mode Store TE owns every local NPU device, so only it can register
+    // one segment on all engines. Clients keep the historical per-device view.
+    // ascend_store_te_init pins the decision to the Store's own TE, like
+    // use_fabric_mem_ above, so a co-located P2P TE cannot inherit it.
+    single_segment_agent_ = agent_mode_ &&
+                            globalConfig().ascend_store_te_init &&
+                            globalConfig().ascend_standalone_single_segment;
+    if (single_segment_agent_) {
+        LOG(INFO) << "[AscendTE] standalone single-segment store layout "
+                     "enabled: registering store memory on all "
+                  << local_engine_device_ids_.size()
+                  << " local engines and routing by requester device";
+        if (use_fabric_mem_) {
+            // Only allocations the Ascend allocator records as store memory
+            // get the shared marker. An adxl::MallocMem fabric allocation is
+            // not recorded, so the store segment may fall back to the engine
+            // of the device that allocated it.
+            LOG(WARNING) << "[AscendTE] single-segment store layout with "
+                            "ASCEND_ENABLE_USE_FABRIC_MEM: fabric allocations "
+                            "are not tracked as store memory, the store "
+                            "segment may be registered on one engine only";
+        }
+    }
+
     TransferExecutorBase::InitParams exec_params;
     exec_params.metadata = metadata_;
     exec_params.local_engine_contexts = local_engine_contexts_;
+    exec_params.local_engine_device_ids = local_engine_device_ids_;
     exec_params.agent_mode = agent_mode_;
     exec_params.roce_mode = roce_mode_;
     exec_params.use_fabric_mem = use_fabric_mem_;
@@ -173,6 +199,7 @@ int AscendDirectTransport::addEngineToSegmentDesc(int32_t device_id,
         return FAILED;
     }
     local_engine_contexts_.push_back(context);
+    local_engine_device_ids_.push_back(device_id);
     desc->rank_info.endpoints.push_back(
         GenAdxlEngineName(host_ip, listen_port));
     return 0;
@@ -352,7 +379,6 @@ int AscendDirectTransport::registerLocalMemory(void *addr, size_t length,
                                                const std::string &location,
                                                bool remote_accessible,
                                                bool update_metadata) {
-    (void)remote_accessible;
     aclrtContext saved_ctx = nullptr;
     if (aclrtGetCurrentContext(&saved_ctx) != ACL_ERROR_NONE) {
         LOG(ERROR) << "aclrtGetCurrentContext failed, errmsg: "
@@ -366,9 +392,38 @@ int AscendDirectTransport::registerLocalMemory(void *addr, size_t length,
     buffer_desc.name = location;
     buffer_desc.addr = (uint64_t)addr;
     buffer_desc.length = (uint64_t)length;
-    int stamp_ret = StampBufferDeviceId(buffer_desc);
-    if (stamp_ret != 0) {
-        return stamp_ret;
+    // A standalone holder publishes one store segment registered on every
+    // local engine. Stamping the device that allocated it would pin the whole
+    // segment to that device's engine, so mark it as shared and let a
+    // requester's own device choose the peer engine. Everything else (client
+    // memory, non-Store TEs) keeps the real device. Only the mounted store
+    // segment is remotely accessible: the allocator records local-only buffers
+    // allocated through it as store ranges too, and those must stay local.
+    const bool shared_store_segment = single_segment_agent_ &&
+                                      remote_accessible &&
+                                      ascend_is_store_memory(addr, length);
+    if (shared_store_segment) {
+        LOG(INFO) << "Publishing shared store segment addr:" << addr
+                  << ", length:" << length << " on all "
+                  << transfer_executor_->getNumEngines()
+                  << " local engine(s), device marker:"
+                  << kSharedSegmentDeviceId;
+        buffer_desc.device_id = kSharedSegmentDeviceId;
+    } else {
+        int stamp_ret = StampBufferDeviceId(buffer_desc);
+        if (stamp_ret != 0) {
+            return stamp_ret;
+        }
+        if (single_segment_agent_ && remote_accessible) {
+            // A remotely accessible buffer the allocator does not record as
+            // store memory (e.g. a hugepage or ADXL fabric store allocation)
+            // cannot be published as the shared segment. Say so instead of
+            // silently falling back to single-engine registration.
+            LOG(WARNING) << "Remote buffer addr:" << addr
+                         << ", length:" << length
+                         << " is not tracked as store memory; the "
+                            "single-segment layout keeps it on one engine";
+        }
     }
 
     adxl::MemType mem_type;
@@ -384,7 +439,8 @@ int AscendDirectTransport::registerLocalMemory(void *addr, size_t length,
     }
 
     const int register_ret = transfer_executor_->registerMem(
-        addr, length, mem_type, transfer_executor_->getUseBufferPool());
+        addr, length, mem_type, transfer_executor_->getUseBufferPool(),
+        /*register_on_all_engines=*/shared_store_segment);
     if (register_ret == 0) {
         return 0;
     }
