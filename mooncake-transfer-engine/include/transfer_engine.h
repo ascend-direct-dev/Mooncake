@@ -64,6 +64,10 @@ enum class PeerLiveness : uint8_t {
 
 struct AutoDiscoverConfig {
     bool enabled = false;
+    // Transport hint, read whether or not auto-discovery is enabled: "efa"
+    // selects EFA, and on an Ascend Direct build the hint decides between
+    // Ascend Direct and the host transports. Written by setAutoDiscover(), or
+    // by the protocol argument of init() when that is not empty.
     std::string protocol;
 };
 
@@ -103,6 +107,11 @@ class TransferEngine {
              const std::string& local_server_name,
              const std::string& ip_or_host_name = "",
              uint64_t rpc_port = 12345);
+
+    int init(const std::string& metadata_conn_string,
+             const std::string& local_server_name,
+             const std::string& ip_or_host_name, uint64_t rpc_port,
+             const std::string& protocol);
 
     int freeEngine();
 

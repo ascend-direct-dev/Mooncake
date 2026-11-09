@@ -113,6 +113,15 @@ int TransferEngine::init(const std::string& metadata_conn_string,
                        rpc_port);
 }
 
+int TransferEngine::init(const std::string& metadata_conn_string,
+                         const std::string& local_server_name,
+                         const std::string& ip_or_host_name, uint64_t rpc_port,
+                         const std::string& protocol) {
+    impl_->applyProtocolHint(protocol);
+    return init(metadata_conn_string, local_server_name, ip_or_host_name,
+                rpc_port);
+}
+
 int TransferEngine::freeEngine() {
     detachShutdownToken(shutdown_token_);
     if (impl_) {
@@ -483,6 +492,19 @@ int TransferEngine::init(const std::string& metadata_conn_string,
         impl_tent_ = std::make_shared<mooncake::tent::TransferEngine>(config);
         return impl_tent_->available() ? 0 : 1;
     }
+}
+
+int TransferEngine::init(const std::string& metadata_conn_string,
+                         const std::string& local_server_name,
+                         const std::string& ip_or_host_name, uint64_t rpc_port,
+                         const std::string& protocol) {
+    if (!use_tent_) {
+        impl_->applyProtocolHint(protocol);
+        return impl_->init(metadata_conn_string, local_server_name,
+                           ip_or_host_name, rpc_port);
+    }
+    return init(metadata_conn_string, local_server_name, ip_or_host_name,
+                rpc_port);
 }
 
 int TransferEngine::freeEngine() {
