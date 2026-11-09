@@ -80,6 +80,38 @@ static cudaError_t copyTcpCudaMemory(void* dst, const void* src, size_t size) {
 #endif
 #endif
 
+#if defined(MOONCAKE_TCP_ASCEND)
+// Ascend HBM staging over classic TCP: a NIC-less staging path for Store
+// buffers that live in device memory. The device is queried per buffer; the
+// user device id returned by ACL is what aclrtSetDevice expects.
+static int getAscendDeviceId(void* addr) {
+    aclrtPtrAttributes attributes{};
+    if (aclrtPointerGetAttributes(addr, &attributes) != ACL_SUCCESS ||
+        attributes.location.type != ACL_MEM_LOCATION_TYPE_DEVICE)
+        return -1;
+    return static_cast<int>(attributes.location.id);
+}
+
+static aclError copyTcpAscendMemory(void* dst, const void* src, size_t size,
+                                    int device, aclrtMemcpyKind kind) {
+    auto status = aclrtSetDevice(device);
+    if (status != ACL_SUCCESS) return status;
+    return aclrtMemcpy(dst, size, src, size, kind);
+}
+
+// One bounded host staging buffer per session, sized by MC_TCP_SLICE_SIZE.
+class TcpStagingBuffer {
+   public:
+    char* ensure(size_t size) {
+        if (buffer_.size() < size) buffer_.resize(size);
+        return buffer_.data();
+    }
+
+   private:
+    std::vector<char> buffer_;
+};
+#endif
+
 // Forward declaration
 class TcpTransport;
 
@@ -137,6 +169,10 @@ struct ServerSession : public std::enable_shared_from_this<ServerSession> {
     char* local_buffer_;
     bool v2_ = false;
     uint64_t status_frame_;
+#ifdef MOONCAKE_TCP_ASCEND
+    int ascend_device_ = -1;
+    TcpStagingBuffer staging_buffer_;
+#endif
 
     void start() {
         total_transferred_bytes_ = 0;
@@ -177,6 +213,9 @@ struct ServerSession : public std::enable_shared_from_this<ServerSession> {
                 v2_ = (header_.opcode & kOpcodeV2Flag) != 0;
                 const uint8_t opcode = header_.opcode & ~kOpcodeV2Flag;
                 local_buffer_ = (char*)(le64toh(header_.addr));
+#ifdef MOONCAKE_TCP_ASCEND
+                ascend_device_ = getAscendDeviceId(local_buffer_);
+#endif
                 uint64_t size = le64toh(header_.size);
                 if (validate_addr_ &&
                     !validate_addr_((uint64_t)local_buffer_, size)) {
@@ -217,6 +256,21 @@ struct ServerSession : public std::enable_shared_from_this<ServerSession> {
 
         char* dram_buffer = addr + total_transferred_bytes_;
         int cuda_device = -1;
+
+#ifdef MOONCAKE_TCP_ASCEND
+        if (ascend_device_ >= 0) {
+            dram_buffer = staging_buffer_.ensure(buffer_size);
+            auto ascend_status = copyTcpAscendMemory(
+                dram_buffer, addr + total_transferred_bytes_, buffer_size,
+                ascend_device_, ACL_MEMCPY_DEVICE_TO_HOST);
+            if (ascend_status != ACL_SUCCESS) {
+                LOG(ERROR) << "ServerSession::writeBody failed to copy from "
+                              "Ascend memory. Error: "
+                           << ascend_status;
+                return;  // Connection will be closed
+            }
+        }
+#endif
 
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
     defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
@@ -291,6 +345,11 @@ struct ServerSession : public std::enable_shared_from_this<ServerSession> {
         char* dram_buffer = addr + total_transferred_bytes_;
         int cuda_device = -1;
 
+#ifdef MOONCAKE_TCP_ASCEND
+        if (ascend_device_ >= 0)
+            dram_buffer = staging_buffer_.ensure(buffer_size);
+#endif
+
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
     defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
     defined(USE_COREX)
@@ -345,6 +404,21 @@ struct ServerSession : public std::enable_shared_from_this<ServerSession> {
                     delete[] dram_buffer;
                 }
 #endif
+#ifdef MOONCAKE_TCP_ASCEND
+                if (ascend_device_ >= 0) {
+                    auto ascend_status = copyTcpAscendMemory(
+                        addr + total_transferred_bytes_, dram_buffer,
+                        transferred_bytes, ascend_device_,
+                        ACL_MEMCPY_HOST_TO_DEVICE);
+                    if (ascend_status != ACL_SUCCESS) {
+                        LOG(ERROR)
+                            << "ServerSession::readBody failed to copy to "
+                               "Ascend memory. Error: "
+                            << ascend_status;
+                        return;  // Connection will be closed
+                    }
+                }
+#endif
                 total_transferred_bytes_ += transferred_bytes;
                 readBody();
             });
@@ -368,6 +442,10 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
     char* local_buffer_;
     bool v2_;
     uint64_t status_frame_;
+#ifdef MOONCAKE_TCP_ASCEND
+    int ascend_device_ = -1;
+    TcpStagingBuffer staging_buffer_;
+#endif
     // v2 WRITE runs the body stream and the ack read concurrently (one
     // async op per direction; handlers serialize on the io thread). The
     // concurrent read lets a rejection — or a v1 server's bogus payload —
@@ -422,6 +500,9 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
     void initiate(void* buffer, uint64_t dest_addr, size_t size,
                   TransferRequest::OpCode opcode) {
         local_buffer_ = (char*)buffer;
+#ifdef MOONCAKE_TCP_ASCEND
+        ascend_device_ = getAscendDeviceId(local_buffer_);
+#endif
         header_.addr = htole64(dest_addr);
         header_.size = htole64(size);
         header_.opcode = (uint8_t)opcode | (v2_ ? kOpcodeV2Flag : 0);
@@ -736,6 +817,11 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
         char* dram_buffer = addr + total_transferred_bytes_;
         int cuda_device = -1;
 
+#ifdef MOONCAKE_TCP_ASCEND
+        if (ascend_device_ >= 0)
+            dram_buffer = staging_buffer_.ensure(buffer_size);
+#endif
+
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
     defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
     defined(USE_COREX)
@@ -810,6 +896,22 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
                     delete[] dram_buffer;
                 }
 #endif
+#ifdef MOONCAKE_TCP_ASCEND
+                if (ascend_device_ >= 0) {
+                    auto ascend_status = copyTcpAscendMemory(
+                        addr + total_transferred_bytes_, dram_buffer,
+                        transferred_bytes, ascend_device_,
+                        ACL_MEMCPY_HOST_TO_DEVICE);
+                    if (ascend_status != ACL_SUCCESS) {
+                        LOG(ERROR)
+                            << "ClientSession::readBody failed to copy to "
+                               "Ascend memory. Error: "
+                            << ascend_status;
+                        finalize(TransferStatusEnum::FAILED, false);
+                        return;
+                    }
+                }
+#endif
                 total_transferred_bytes_ += transferred_bytes;
                 readBody();
             });
@@ -871,6 +973,22 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
                               "CUDA memory. "
                            << "Error: " << cudaGetErrorString(cuda_status);
                 delete[] dram_buffer;
+                abortWrite();
+                return;
+            }
+        }
+#endif
+
+#ifdef MOONCAKE_TCP_ASCEND
+        if (ascend_device_ >= 0) {
+            dram_buffer = staging_buffer_.ensure(buffer_size);
+            auto ascend_status = copyTcpAscendMemory(
+                dram_buffer, addr + total_transferred_bytes_, buffer_size,
+                ascend_device_, ACL_MEMCPY_DEVICE_TO_HOST);
+            if (ascend_status != ACL_SUCCESS) {
+                LOG(ERROR) << "ClientSession::writeBody failed to copy from "
+                              "Ascend memory. Error: "
+                           << ascend_status;
                 abortWrite();
                 return;
             }

@@ -45,6 +45,12 @@
 
 #include "cuda_alike.h"
 
+#if defined(USE_ASCEND) || defined(USE_ASCEND_DIRECT) || \
+    defined(USE_ASCEND_HETEROGENEOUS) || defined(USE_UBSHMEM)
+#define MOONCAKE_TCP_ASCEND
+#include <acl/acl.h>
+#endif
+
 namespace mooncake {
 using tcpsocket = asio::ip::tcp::socket;
 
@@ -300,10 +306,15 @@ TcpTransport::TcpTransport()
     }
 
     constexpr size_t kDefaultLanesPerPeer = 4;
-    constexpr size_t kDefaultQueuedTransfersPerPeer = 1024;
-    constexpr size_t kMaxQueuedTransfersPerPeer = 65535;
-    constexpr size_t kDefaultPendingAdmissionsPerPeer = 1024;
-    constexpr size_t kMaxPendingAdmissionsPerPeer = 65535;
+    // Store's remote batch transfers submit one work item per registered
+    // slice: a 320-key x 122-segment batch is ~39K items, which the historical
+    // 1K queue/pending defaults rejected outright (hard rejection -> batch
+    // timeout). These match the newer transport defaults so the same workload
+    // is admitted instead of dropped.
+    constexpr size_t kDefaultQueuedTransfersPerPeer = 65535;
+    constexpr size_t kMaxQueuedTransfersPerPeer = 1048576;
+    constexpr size_t kDefaultPendingAdmissionsPerPeer = 65535;
+    constexpr size_t kMaxPendingAdmissionsPerPeer = 1048576;
     constexpr size_t kDefaultAdmissionTimeoutMs = 1000;
     constexpr size_t kMaxAdmissionTimeoutMs = 600000;
 
